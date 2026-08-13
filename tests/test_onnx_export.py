@@ -874,6 +874,45 @@ class OnnxExporterTests(unittest.TestCase):
             self.assertFalse((destination / "READY").exists())
             self.assertTrue(displaced_staging.is_dir())
 
+    def test_publication_hides_symlink_source_replaced_at_atomic_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            destination = paths["output"].absolute()
+            foreign = destination.with_name("foreign-export")
+            real_rename = onnx_export._rename_directory_no_replace
+
+            def replace_source_with_symlink(
+                parent_descriptor: int,
+                source_name: str,
+                destination_name: str,
+            ) -> None:
+                source = destination.parent / source_name
+                source.rename(source.with_name(f"{source.name}.displaced"))
+                foreign.mkdir()
+                (foreign / "detector.onnx").write_bytes(b"foreign-model")
+                (foreign / "metadata.json").write_bytes(b"foreign-metadata")
+                (foreign / "READY").write_bytes(b"foreign-ready")
+                source.symlink_to(foreign, target_is_directory=True)
+                real_rename(parent_descriptor, source_name, destination_name)
+
+            with patch.object(
+                onnx_export,
+                "_rename_directory_no_replace",
+                replace_source_with_symlink,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity"):
+                    export_detector_onnx(
+                        **paths,
+                        torch_module=_FakeTorch(),
+                        timm_module=_FakeTimm(_FakeDetector()),
+                        import_module=lambda name: _FakeOnnx()
+                        if name == "onnx"
+                        else _missing_onnx(name),
+                    )
+
+            self.assertFalse(os.path.lexists(destination))
+            self.assertEqual((foreign / "READY").read_bytes(), b"foreign-ready")
+
     def test_staging_cleanup_does_not_remove_an_empty_replacement_directory(
         self,
     ) -> None:
