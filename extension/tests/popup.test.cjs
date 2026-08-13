@@ -52,3 +52,18 @@ test("popup exposes service-worker failures and always re-enables scanning", asy
   assert.equal(popup.status.textContent, "Scan failed: No active tab.");
   assert.equal(popup.button.disabled, false);
 });
+
+test("popup rejects malformed or inconsistent scan summaries", async (t) => {
+  for (const [response, expected] of [
+    [{ ok: true, count: -1, errors: 0, skipped: 0 }, /invalid count count/i],
+    [{ ok: true, count: 1, errors: 2, skipped: 0 }, /more errors than scanned/i],
+    [undefined, /could not be scanned/i],
+  ]) {
+    await t.test(expected.source, async () => {
+      const popup = loadPopup(async () => response);
+      await popup.button.click();
+      assert.match(popup.status.textContent, expected);
+      assert.equal(popup.button.disabled, false);
+    });
+  }
+});

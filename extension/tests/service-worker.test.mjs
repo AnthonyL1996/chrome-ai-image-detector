@@ -106,7 +106,7 @@ test("image scoring is bound to the top frame of the tab being scanned", async (
     },
   );
   assert.deepEqual(scan, { ok: true, count: 1, errors: 1, skipped: 0 });
-  assert.deepEqual(calls, [
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
     ["insertCSS", { target: { tabId: 17 }, files: ["content.css"] }],
     ["executeScript", { target: { tabId: 17 }, files: ["content.js"] }],
   ]);
@@ -132,4 +132,54 @@ test("scoring rejects extension-ID mismatches and non-top frames", async () => {
     assert.equal(response.ok, false);
     assert.match(response.error, /sender|frame|active scan/i);
   }
+});
+
+test("scan requests reject missing active tabs and unknown messages", async () => {
+  const worker = await loadServiceWorker({
+    tabs: {
+      query: async () => [],
+      sendMessage: async () => assert.fail("no tab should be messaged"),
+    },
+  });
+  const popup = {
+    id: "extension-id",
+    url: "chrome-extension://extension-id/popup.html",
+  };
+
+  const noTab = await worker.dispatch({ type: "SCAN_ACTIVE_TAB" }, popup);
+  assert.equal(noTab.ok, false);
+  assert.match(noTab.error, /no active webpage tab/i);
+
+  const unknown = await worker.dispatch({ type: "NOT_A_REAL_MESSAGE" }, popup);
+  assert.equal(unknown.ok, false);
+  assert.match(unknown.error, /unknown extension message/i);
+});
+
+test("a tab is reserved before asynchronous scan setup begins", async () => {
+  let releaseSetup;
+  let setupStarted;
+  const setupGate = new Promise((resolve) => { releaseSetup = resolve; });
+  const setupSignal = new Promise((resolve) => { setupStarted = resolve; });
+  const worker = await loadServiceWorker({
+    scripting: {
+      insertCSS: async () => {
+        setupStarted();
+        await setupGate;
+      },
+      executeScript: async () => {},
+    },
+  });
+  const popup = {
+    id: "extension-id",
+    url: "chrome-extension://extension-id/popup.html",
+  };
+
+  const firstScan = worker.dispatch({ type: "SCAN_ACTIVE_TAB" }, popup);
+  await setupSignal;
+  const overlapping = await worker.dispatch({ type: "SCAN_ACTIVE_TAB" }, popup);
+  assert.equal(overlapping.ok, false);
+  assert.match(overlapping.error, /already has an active image scan/i);
+
+  releaseSetup();
+  assert.equal((await firstScan).ok, true);
 });

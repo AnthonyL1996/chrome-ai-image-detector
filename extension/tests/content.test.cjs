@@ -153,6 +153,44 @@ test("scanPage turns messaging failures into visible per-image errors", async ()
   assert.deepEqual(summary, { count: 1, errors: 1, skipped: 0 });
 });
 
+test("scanPage reports an empty or unsupported page without messaging", async () => {
+  const page = fakePage([
+    { currentSrc: "", src: "file:///tmp/private.png", alt: "unsupported" },
+  ]);
+
+  const summary = await scanPage({
+    root: page.root,
+    sendMessage: async () => assert.fail("empty scans must not request scoring"),
+  });
+
+  assert.deepEqual(summary, { count: 0, errors: 0, skipped: 1 });
+  assert.equal(page.annotations.length, 0);
+  assert.equal(page.liveRegions[0].textContent, "0 images scanned; 0 unavailable; 1 skipped.");
+});
+
+test("scanPage rejects non-terminal, mismatched, and duplicated result records", async (t) => {
+  const responses = [
+    { ok: false, error: "runtime unavailable" },
+    { ok: true, results: [] },
+    { ok: true, results: [{ id: "unexpected", status: "error", message: "no" }] },
+    { ok: true, results: [{ id: "image-1", status: "pending" }] },
+  ];
+
+  for (const [index, response] of responses.entries()) {
+    await t.test(`invalid response ${index + 1}`, async () => {
+      const page = fakePage([
+        { currentSrc: "blob:https://example.test/image", src: "", alt: "" },
+      ]);
+      const summary = await scanPage({
+        root: page.root,
+        sendMessage: async () => response,
+      });
+      assert.deepEqual(summary, { count: 1, errors: 1, skipped: 0 });
+      assert.match(page.annotations[0].textContent, /Scan failed locally/);
+    });
+  }
+});
+
 test("scanPage removes only nodes it owns and restores image descriptions", async () => {
   const image = { currentSrc: "https://example.test/a.png", src: "", alt: "A" };
   const page = fakePage([image]);
