@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import tempfile
@@ -13,6 +14,7 @@ from poidh_detector.calibration_fit import (
     CalibrationPrediction,
     CalibrationPredictions,
 )
+from poidh_detector.contracts import SampleRecord
 from poidh_detector.data import SplitManifest
 from poidh_detector.inference import (
     FIXED_THRESHOLD,
@@ -31,6 +33,9 @@ from poidh_detector.torch_training import (
 )
 from poidh_detector.training import CheckpointCandidate, TrainingConfig
 from tools.predict_detector import main
+
+
+_TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 
 
 def _digest(value: str) -> str:
@@ -86,6 +91,32 @@ def _rows(partition: str) -> tuple[CalibrationPrediction, ...]:
         CalibrationPrediction(f"{partition}-ai", 2.0, 1),
         CalibrationPrediction(f"{partition}-real", -2.0, 0),
     )
+
+
+def _sample_records() -> tuple[SampleRecord, ...]:
+    rows = []
+    for sample_id, label in (
+        ("train-ai", 1),
+        ("train-real", 0),
+        ("validation-ai", 1),
+        ("validation-real", 0),
+        ("calibration-ai", 1),
+        ("calibration-real", 0),
+    ):
+        rows.append(
+            SampleRecord(
+                sample_id=sample_id,
+                source_id="source",
+                upstream_path=f"upstream/{sample_id}.png",
+                local_path=f"images/{sample_id}.png",
+                label=label,
+                content_sha256=_digest(f"content:{sample_id}"),
+                provenance_group=f"group:{sample_id}",
+                generator_family="test-generator" if label else None,
+                content_type="image/png",
+            )
+        )
+    return tuple(rows)
 
 
 def _publish_run(root: Path) -> tuple[Path, TrainingConfig, EnvironmentFingerprint]:
@@ -218,17 +249,24 @@ class InferenceResultTests(unittest.TestCase):
                 **(common | {"training_config": changed_config}),
             )
 
+    def test_does_not_claim_partition_digest_proves_holdout_overlap(self) -> None:
+        split = _split_manifest()
         validation_digest = partition_sha256(split.assignments, "validation")
-        exposed_config = replace(
-            config,
+        config = replace(
+            _training_config(split),
             exposed_holdout_sha256=(validation_digest, _digest("mirage-v1")),
         )
-        with self.assertRaisesRegex(ValueError, "exposed holdout"):
-            build_inference_result(
-                partition="validation",
-                predictions=_rows("validation"),
-                **(common | {"training_config": exposed_config}),
-            )
+
+        result = build_inference_result(
+            partition="validation",
+            predictions=_rows("validation"),
+            training_config=config,
+            split_manifest=split,
+            checkpoint_sha256=_digest("checkpoint"),
+            environment=_environment(),
+        )
+
+        self.assertEqual(result.partition_sha256, validation_digest)
 
     def test_metrics_require_both_classes_and_use_fixed_threshold(self) -> None:
         split = _split_manifest()
@@ -263,6 +301,7 @@ class InferenceResultTests(unittest.TestCase):
 
 
 class SelectedCheckpointTests(unittest.TestCase):
+    @unittest.skipUnless(_TORCH_AVAILABLE, "PyTorch integration test")
     def test_loads_only_verified_current_generation_with_exact_environment(
         self,
     ) -> None:
@@ -285,6 +324,7 @@ class SelectedCheckpointTests(unittest.TestCase):
             self.assertFalse(loaded.model.training)
             self.assertEqual(loaded.model(torch.tensor([[2.0]])).item(), 3.5)
 
+    @unittest.skipUnless(_TORCH_AVAILABLE, "PyTorch integration test")
     def test_rejects_changed_environment_or_checkpoint_bytes(self) -> None:
         import torch
 
@@ -311,6 +351,7 @@ class SelectedCheckpointTests(unittest.TestCase):
                     model_factory=lambda: torch.nn.Linear(1, 1),
                 )
 
+    @unittest.skipUnless(_TORCH_AVAILABLE, "PyTorch integration test")
     def test_predict_logits_preserves_dataset_order(self) -> None:
         import torch
 
@@ -413,8 +454,95 @@ class SelectedCheckpointTests(unittest.TestCase):
                 torch_module=object(),
             )
 
+    def test_run_inference_rejects_real_sample_id_overlap_with_registered_holdout(
+        self,
+    ) -> None:
+        split = _split_manifest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            holdout_path = root / "mirage-v1.json"
+            holdout_payload = json.dumps(
+                {
+                    "schema_version": 1,
+                    "entries": [
+                        {
+                            "file_name": "validation-ai",
+                            "content_sha256": _digest("different-content"),
+                        }
+                    ],
+                },
+                sort_keys=True,
+            ).encode()
+            holdout_path.write_bytes(holdout_payload)
+            holdout_digest = hashlib.sha256(holdout_payload).hexdigest()
+            config = replace(
+                _training_config(split),
+                exposed_holdout_sha256=(holdout_digest,),
+            )
+            (root / "preparation.json").write_text(
+                json.dumps(
+                    {
+                        "manifest_sha256": config.dataset_manifest_sha256,
+                        "splits_sha256": config.split_manifest_sha256,
+                        "exposed_holdout_manifest_sha256": [holdout_digest],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest = SimpleNamespace(
+                sha256=config.dataset_manifest_sha256,
+                samples=_sample_records(),
+                verify_materialized_files=Mock(),
+            )
+            selected = SimpleNamespace(
+                model=object(),
+                training_config=config,
+                environment=_environment(),
+                checkpoint_sha256=_digest("checkpoint"),
+            )
+            with (
+                patch(
+                    "poidh_detector.inference.load_selected_checkpoint",
+                    return_value=selected,
+                ),
+                patch(
+                    "poidh_detector.inference.load_dataset_manifest",
+                    return_value=manifest,
+                ),
+                patch(
+                    "poidh_detector.inference.load_split_manifest",
+                    return_value=split,
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "sample ID overlap"):
+                    run_inference(
+                        root,
+                        Path("/run"),
+                        partition="validation",
+                        holdout_manifests=(holdout_path,),
+                        batch_size=8,
+                        workers=0,
+                        device="cpu",
+                        torch_module=object(),
+                    )
+
 
 class PredictionCliTests(unittest.TestCase):
+    def test_cli_requires_registered_holdout_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("tools.predict_detector.run_inference"):
+                with self.assertRaises(SystemExit):
+                    main(
+                        [
+                            "/dataset",
+                            "/run",
+                            "--partition",
+                            "validation",
+                            "--output",
+                            str(Path(temporary) / "predictions.json"),
+                        ]
+                    )
+
     def test_cli_writes_fitter_compatible_output_without_overwrite(self) -> None:
         split = _split_manifest()
         result = build_inference_result(
@@ -438,6 +566,8 @@ class PredictionCliTests(unittest.TestCase):
                         "calibration",
                         "--output",
                         str(output),
+                        "--holdout-manifest",
+                        "/holdouts/mirage-v1.json",
                         "--device",
                         "cpu",
                     ]
@@ -455,6 +585,8 @@ class PredictionCliTests(unittest.TestCase):
                             "calibration",
                             "--output",
                             str(output),
+                            "--holdout-manifest",
+                            "/holdouts/mirage-v1.json",
                         ]
                     )
 
