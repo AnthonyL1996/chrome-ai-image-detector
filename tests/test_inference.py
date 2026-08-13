@@ -5,7 +5,9 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import ANY, Mock, patch
 
 from poidh_detector.calibration_fit import (
     CalibrationPrediction,
@@ -18,6 +20,7 @@ from poidh_detector.inference import (
     load_selected_checkpoint,
     partition_sha256,
     predict_logits,
+    run_inference,
 )
 from poidh_detector.reproducibility import EnvironmentFingerprint
 from poidh_detector.torch_training import (
@@ -339,6 +342,76 @@ class SelectedCheckpointTests(unittest.TestCase):
         self.assertEqual([row.sample_id for row in predictions], ["z", "a"])
         self.assertEqual([row.raw_logit for row in predictions], [2.0, -2.0])
         self.assertEqual([row.label for row in predictions], [1, 0])
+
+    def test_run_inference_verifies_data_and_uses_only_named_partition(self) -> None:
+        split = _split_manifest()
+        config = _training_config(split)
+        manifest = Mock(sha256=config.dataset_manifest_sha256)
+        selected = SimpleNamespace(
+            model=object(),
+            training_config=config,
+            environment=_environment(),
+            checkpoint_sha256=_digest("checkpoint"),
+        )
+        samples = (object(), object())
+        dataset = object()
+        with (
+            patch(
+                "poidh_detector.inference.load_selected_checkpoint",
+                return_value=selected,
+            ) as load_checkpoint,
+            patch(
+                "poidh_detector.inference.load_dataset_manifest",
+                return_value=manifest,
+            ),
+            patch(
+                "poidh_detector.inference.load_split_manifest", return_value=split
+            ) as load_split,
+            patch(
+                "poidh_detector.inference.samples_for_split", return_value=samples
+            ) as select_samples,
+            patch(
+                "poidh_detector.inference.DatasetImageSamples", return_value=dataset
+            ) as build_dataset,
+            patch(
+                "poidh_detector.inference.predict_logits",
+                return_value=_rows("validation"),
+            ) as predict,
+            patch("poidh_detector.inference.configure_determinism") as deterministic,
+        ):
+            result = run_inference(
+                Path("/dataset"),
+                Path("/run"),
+                partition="validation",
+                batch_size=8,
+                workers=0,
+                device="cpu",
+                torch_module=object(),
+            )
+
+        self.assertEqual(result.partition, "validation")
+        load_checkpoint.assert_called_once()
+        load_split.assert_called_once_with(
+            Path("/dataset/splits.json"),
+            manifest,
+            expected_sha256=config.split_manifest_sha256,
+        )
+        manifest.verify_materialized_files.assert_called_once_with(Path("/dataset"))
+        deterministic.assert_called_once_with(config.seed, torch_module=ANY)
+        select_samples.assert_called_once_with(manifest, split, "validation")
+        build_dataset.assert_called_once_with(samples, Path("/dataset"))
+        predict.assert_called_once()
+
+        with self.assertRaisesRegex(ValueError, "calibration or validation"):
+            run_inference(
+                Path("/dataset"),
+                Path("/run"),
+                partition="train",
+                batch_size=8,
+                workers=0,
+                device="cpu",
+                torch_module=object(),
+            )
 
 
 class PredictionCliTests(unittest.TestCase):
