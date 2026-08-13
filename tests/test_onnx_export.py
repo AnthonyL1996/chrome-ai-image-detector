@@ -577,6 +577,45 @@ class OnnxExporterTests(unittest.TestCase):
             self.assertFalse((destination / "READY").exists())
             self.assertTrue(displaced.is_dir())
 
+    def test_publication_does_not_acquire_a_destination_replaced_after_mkdir(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            destination = paths["output"].absolute()
+            displaced = destination.with_name("displaced-export")
+            foreign_model = destination / "detector.onnx"
+            real_mkdir = Path.mkdir
+            destination_mkdir_called = False
+
+            def replace_after_destination_mkdir(
+                path: Path,
+                mode: int = 0o777,
+                parents: bool = False,
+                exist_ok: bool = False,
+            ) -> None:
+                nonlocal destination_mkdir_called
+                real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+                if path.absolute() == destination:
+                    destination_mkdir_called = True
+                    destination.rename(displaced)
+                    real_mkdir(destination)
+                    foreign_model.write_bytes(b"foreign-model")
+
+            with patch.object(Path, "mkdir", replace_after_destination_mkdir):
+                metadata = export_detector_onnx(
+                    **paths,
+                    torch_module=_FakeTorch(),
+                    timm_module=_FakeTimm(_FakeDetector()),
+                    import_module=lambda name: _FakeOnnx()
+                    if name == "onnx"
+                    else _missing_onnx(name),
+                )
+
+            self.assertFalse(destination_mkdir_called)
+            self.assertFalse(displaced.exists())
+            self.assertEqual(onnx_export.validate_export_bundle(destination), metadata)
+
     def test_cleanup_does_not_delete_replacement_after_ownership_read(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self._inputs(Path(temporary))
@@ -733,6 +772,57 @@ class OnnxExporterTests(unittest.TestCase):
             assert foreign_file is not None
             self.assertEqual(foreign_file.read_text(encoding="ascii"), "foreign")
             self.assertTrue(displaced_staging.is_dir())
+
+    def test_publication_does_not_move_files_from_a_replaced_staging_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            destination = paths["output"].absolute()
+            staging_replacement: Path | None = None
+            displaced_staging: Path | None = None
+            real_publish_bundle = onnx_export._publish_bundle
+
+            def replace_staging_before_publication(
+                staging: Path, *arguments: object
+            ) -> int:
+                nonlocal staging_replacement, displaced_staging
+                metadata = next(
+                    argument
+                    for argument in arguments
+                    if isinstance(argument, ExportMetadata)
+                )
+                displaced_staging = staging.with_name(f"{staging.name}.displaced")
+                staging.rename(displaced_staging)
+                staging.mkdir()
+                staging_replacement = staging
+                (staging / "detector.onnx").write_bytes(b"foreign-model")
+                (staging / "metadata.json").write_bytes(metadata.to_json_bytes())
+                return real_publish_bundle(staging, *arguments)
+
+            with patch.object(
+                onnx_export,
+                "_publish_bundle",
+                replace_staging_before_publication,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity"):
+                    export_detector_onnx(
+                        **paths,
+                        torch_module=_FakeTorch(),
+                        timm_module=_FakeTimm(_FakeDetector()),
+                        import_module=lambda name: _FakeOnnx()
+                        if name == "onnx"
+                        else _missing_onnx(name),
+                    )
+
+            assert staging_replacement is not None
+            assert displaced_staging is not None
+            self.assertEqual(
+                (staging_replacement / "detector.onnx").read_bytes(),
+                b"foreign-model",
+            )
+            self.assertTrue(displaced_staging.is_dir())
+            self.assertFalse((destination / "READY").exists())
 
     def test_staging_cleanup_does_not_remove_an_empty_replacement_directory(
         self,
