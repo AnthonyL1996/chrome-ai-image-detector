@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from html.parser import HTMLParser
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -57,7 +58,11 @@ class ExtensionContracts(unittest.TestCase):
         self.assertNotIn("externally_connectable", self.manifest)
         self.assertEqual(
             self.manifest["content_security_policy"]["extension_pages"],
-            "script-src 'self'; object-src 'self'",
+            "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'",
+        )
+        self.assertNotIn(
+            "unsafe-eval",
+            self.manifest["content_security_policy"]["extension_pages"].split(),
         )
 
     def test_manifest_declares_popup_and_module_service_worker(self) -> None:
@@ -113,6 +118,36 @@ class ExtensionContracts(unittest.TestCase):
         self.assertIn("localOnly: true", source)
         self.assertIn('redirect: "error"', source)
 
+    def test_vendored_onnx_runtime_assets_are_pinned(self) -> None:
+        expected = {
+            "ort.wasm.bundle.min.mjs": (
+                "1db5e1c5cd2b860eed85e6eeff23e2aaa7cffcc407f67093bcc888f631b94ba9"
+            ),
+            "ort-wasm-simd-threaded.mjs": (
+                "0a1e718d99c41b22c21f2520ff4f9e883a6b5533856e398d21816ee8eb8185d3"
+            ),
+            "ort-wasm-simd-threaded.wasm": (
+                "d1ab1b94b16a65b29d710d0b587b29e7bed336827577623913479b8afe8113e6"
+            ),
+        }
+        vendor = EXTENSION / "runtime" / "vendor"
+        self.assertEqual(
+            {path.name for path in vendor.iterdir()}, set(expected)
+        )
+        for name, digest in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    hashlib.sha256((vendor / name).read_bytes()).hexdigest(), digest
+                )
+
+    def test_onnx_runtime_wrapper_forces_local_single_threaded_wasm(self) -> None:
+        source = (EXTENSION / "runtime" / "ort-runtime.mjs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('chrome.runtime.getURL("runtime/vendor/")', source)
+        self.assertIn("ort.env.wasm.numThreads = 1", source)
+        self.assertIn("ort.env.wasm.proxy = false", source)
+
     def test_extension_javascript_has_no_remote_or_dynamic_code_execution(self) -> None:
         forbidden = re.compile(
             r"\b(?:eval|Function|fetch|XMLHttpRequest|WebSocket|sendBeacon)\s*\("
@@ -122,6 +157,12 @@ class ExtensionContracts(unittest.TestCase):
         for path in javascript:
             with self.subTest(path=path.relative_to(ROOT)):
                 source = path.read_text(encoding="utf-8")
+                if path.parts[-3:-1] == ("runtime", "vendor"):
+                    # ONNX Runtime Web is vendored under its upstream MIT
+                    # license; its internal WASM loader necessarily contains
+                    # fetch calls. The extension-owned adapter is checked
+                    # below and remains free of remote code execution.
+                    continue
                 self.assertNotRegex(source, forbidden)
                 self.assertNotIn("unsafe-eval", source)
 

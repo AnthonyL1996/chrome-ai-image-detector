@@ -1,7 +1,12 @@
-import { createModelRuntime } from "./runtime/model-runtime.mjs";
+import {
+  createModelRuntime,
+  validateImageRequests,
+} from "./runtime/model-runtime.mjs";
 import { loadOnnxBackend } from "./runtime/onnx-backend.mjs";
+import ort from "./runtime/ort-runtime.mjs";
 
-const activeScanTabs = new Set();
+const SUPPORTED_SOURCE = /^(?:https?:|blob:|data:image\/)/i;
+const activeScanTabs = new Map();
 let runtimePromise;
 
 function requirePopupSender(sender) {
@@ -22,9 +27,11 @@ function requireScoringSender(sender) {
   if (!Number.isInteger(sender.tab?.id) || sender.frameId !== 0) {
     throw new Error("Image scoring requests must come from a webpage top frame.");
   }
-  if (!activeScanTabs.has(sender.tab.id)) {
+  const scan = activeScanTabs.get(sender.tab.id);
+  if (scan === undefined || typeof scan.pageOrigin !== "string") {
     throw new Error("Image scoring request is not bound to an active tab scan.");
   }
+  return scan;
 }
 
 async function scanActiveTab(sender) {
@@ -37,9 +44,10 @@ async function scanActiveTab(sender) {
     throw new Error("This tab already has an active image scan.");
   }
 
-  activeScanTabs.add(tab.id);
+  const scan = { pageOrigin: null };
+  activeScanTabs.set(tab.id, scan);
   try {
-    await ensureOriginAccess(tab);
+    scan.pageOrigin = await ensureOriginAccess(tab);
     await chrome.scripting.insertCSS({
       target: { tabId: tab.id },
       files: ["content.css"],
@@ -55,33 +63,80 @@ async function scanActiveTab(sender) {
 }
 
 async function ensureOriginAccess(tab) {
+  const url = new URL(typeof tab.url === "string" ? tab.url : "");
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("The active page has no requestable web origin.");
+  }
   if (
     !chrome.permissions ||
     typeof chrome.permissions.contains !== "function" ||
     typeof chrome.permissions.request !== "function"
   ) {
-    return;
-  }
-  const url = new URL(typeof tab.url === "string" ? tab.url : "");
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("The active page has no requestable web origin.");
+    return url.origin;
   }
   const origin = `${url.origin}/*`;
   const details = { origins: [origin] };
   if (await chrome.permissions.contains(details)) {
-    return;
+    return url.origin;
   }
   if (!(await chrome.permissions.request(details))) {
     throw new Error(`Optional access to ${url.origin} was denied.`);
   }
+  return url.origin;
+}
+
+function partitionScoringSources(images, { pageOrigin }) {
+  const allowed = [];
+  const blocked = [];
+  for (const image of images) {
+    const source = image.source;
+    if (/^data:image\//i.test(source)) {
+      allowed.push(image);
+      continue;
+    }
+    const url = new URL(source);
+    if (url.origin === pageOrigin) {
+      allowed.push(image);
+      continue;
+    }
+    blocked.push({
+      id: image.id,
+      status: "error",
+      code: "IMAGE_ORIGIN_NOT_ALLOWED",
+      message: "Image source origin differs from the active page origin.",
+    });
+  }
+  return { allowed, blocked };
+}
+
+function mergeScoringResults(requests, allowedResults, blockedResults) {
+  const byId = new Map(
+    [...allowedResults, ...blockedResults].map((result) => [result.id, result]),
+  );
+  return requests.map(({ id }) => byId.get(id));
+}
+
+function validateAndPartitionScoringSources(images, scan) {
+  const requests = validateImageRequests(images);
+  for (const image of requests) {
+    if (!SUPPORTED_SOURCE.test(image.source)) {
+      throw new TypeError("image source is unsupported");
+    }
+    try {
+      const url = new URL(image.source);
+      if (!["http:", "https:", "blob:"].includes(url.protocol) &&
+          !/^data:image\//i.test(image.source)) {
+        throw new TypeError("image source is unsupported");
+      }
+    } catch {
+      throw new TypeError("image source is not a valid URL");
+    }
+  }
+  return { requests, ...partitionScoringSources(requests, scan) };
 }
 
 async function loadRuntime() {
   try {
-    const ort = globalThis.POIDH_ORT;
-    if (!ort) {
-      return createModelRuntime();
-    }
     const backend = await loadOnnxBackend({
       ort,
       modelUrl: chrome.runtime.getURL("model/detector.onnx"),
@@ -106,8 +161,15 @@ async function routeMessage(message, sender) {
     case "SCAN_ACTIVE_TAB":
       return scanActiveTab(sender);
     case "SCORE_IMAGES": {
-      requireScoringSender(sender);
-      const results = await (await getRuntime()).scoreImages(message.images);
+      const scan = requireScoringSender(sender);
+      const { requests, allowed, blocked } = validateAndPartitionScoringSources(
+        message.images,
+        scan,
+      );
+      const scored = allowed.length === 0
+        ? []
+        : await (await getRuntime()).scoreImages(allowed);
+      const results = mergeScoringResults(requests, scored, blocked);
       return { ok: true, results };
     }
     default:

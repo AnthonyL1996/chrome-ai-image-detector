@@ -2,6 +2,8 @@ const IMAGE_SIZE = 224;
 const CHANNELS = 3;
 const TENSOR_LENGTH = CHANNELS * IMAGE_SIZE * IMAGE_SIZE;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_IMAGE_PIXELS = 16 * 1024 * 1024;
+const MAX_RESAMPLE_TAPS = 4097;
 const MAX_MODEL_BYTES = 100 * 1024 * 1024;
 const MODEL_INPUT = "image";
 const MODEL_OUTPUT = "probability_ai";
@@ -35,6 +37,8 @@ export async function loadOnnxBackend({
   if (typeof metadataUrl !== "string" || !metadataUrl.trim()) {
     throw new TypeError("metadataUrl must be a non-empty string");
   }
+  assertExtensionResourceUrl(modelUrl, "ONNX model");
+  assertExtensionResourceUrl(metadataUrl, "ONNX metadata");
   if (!cryptoImpl?.subtle || typeof cryptoImpl.subtle.digest !== "function") {
     throw new TypeError("Web Crypto SHA-256 is required");
   }
@@ -85,6 +89,22 @@ export async function loadOnnxBackend({
   });
 }
 
+function assertExtensionResourceUrl(url, description) {
+  let parsed;
+  try {
+    parsed = new URL(url, "chrome-extension://local/");
+  } catch {
+    throw new Error(`${description} URL is invalid`);
+  }
+  if (parsed.protocol !== "chrome-extension:") {
+    throw new Error(`${description} must be an extension-local resource`);
+  }
+  const runtimeId = globalThis.chrome?.runtime?.id;
+  if (runtimeId && parsed.hostname !== runtimeId) {
+    throw new Error(`${description} is outside this extension`);
+  }
+}
+
 async function scoreImage(image, session, ort, tensorLoader) {
   const id = typeof image?.id === "string" ? image.id : "";
   if (!id) {
@@ -111,7 +131,12 @@ async function scoreImage(image, session, ort, tensorLoader) {
 function readProbability(outputs) {
   const output = outputs?.[MODEL_OUTPUT];
   const values = output?.data;
-  if (!values || values.length !== 1) {
+  if (
+    output?.type !== "float32" ||
+    !sameArray(output?.dims, [1, 1]) ||
+    !values ||
+    values.length !== 1
+  ) {
     throw new Error("model output has an invalid shape");
   }
   const confidence = Number(values[0]);
@@ -143,7 +168,7 @@ function validateMetadata(metadata) {
   if (
     metadata.schema_version !== 1 ||
     metadata.model_format !== "onnx" ||
-    metadata.model_sha256 !== undefined && !/^[0-9a-f]{64}$/.test(metadata.model_sha256) ||
+    (metadata.model_sha256 !== undefined && !/^[0-9a-f]{64}$/.test(metadata.model_sha256)) ||
     metadata.input_name !== MODEL_INPUT ||
     !sameArray(metadata.input_shape, [1, 3, IMAGE_SIZE, IMAGE_SIZE]) ||
     metadata.input_dtype !== "float32" ||
@@ -249,38 +274,117 @@ function createImageTensorLoader({
     }
     const mime = response.headers?.get?.("content-type") || "application/octet-stream";
     const bitmap = await imageBitmapFactory(new BlobConstructor([bytes], { type: mime }));
-    const canvas = canvasFactory(IMAGE_SIZE, IMAGE_SIZE);
+    const width = Number(bitmap?.width);
+    const height = Number(bitmap?.height);
+    if (
+      !Number.isInteger(width) ||
+      !Number.isInteger(height) ||
+      width < 1 ||
+      height < 1 ||
+      width * height > MAX_IMAGE_PIXELS
+    ) {
+      bitmap?.close?.();
+      throw new Error("decoded image dimensions exceed the 16 megapixel limit");
+    }
+    const canvas = canvasFactory(width, height);
     const context = canvas?.getContext?.("2d", { willReadFrequently: true });
     if (!context || typeof context.drawImage !== "function" || typeof context.getImageData !== "function") {
       bitmap?.close?.();
       throw new Error("browser image canvas is unavailable");
     }
-    context.imageSmoothingEnabled = true;
-    context.imageSmoothingQuality = "high";
     try {
-      context.drawImage(bitmap, 0, 0, IMAGE_SIZE, IMAGE_SIZE);
-      return tensorFromRgba(context.getImageData(0, 0, IMAGE_SIZE, IMAGE_SIZE).data);
+      context.drawImage(bitmap, 0, 0, width, height);
+      return tensorFromRgba(
+        context.getImageData(0, 0, width, height).data,
+        width,
+        height,
+      );
     } finally {
       bitmap?.close?.();
     }
   };
 }
 
-function tensorFromRgba(rgba) {
-  if (!rgba || rgba.length !== IMAGE_SIZE * IMAGE_SIZE * 4) {
+function tensorFromRgba(rgba, sourceWidth, sourceHeight) {
+  if (
+    !rgba ||
+    !Number.isInteger(sourceWidth) ||
+    !Number.isInteger(sourceHeight) ||
+    sourceWidth < 1 ||
+    sourceHeight < 1 ||
+    rgba.length !== sourceWidth * sourceHeight * 4
+  ) {
     throw new Error("decoded image has an invalid size");
   }
   const tensor = new Float32Array(TENSOR_LENGTH);
   const plane = IMAGE_SIZE * IMAGE_SIZE;
-  for (let pixel = 0; pixel < plane; pixel += 1) {
-    const source = pixel * 4;
-    for (let channel = 0; channel < CHANNELS; channel += 1) {
-      const value = rgba[source + channel] / 255;
-      tensor[channel * plane + pixel] =
-        (value - MEAN[channel]) / STANDARD_DEVIATION[channel];
+  const xTaps = bicubicTaps(sourceWidth, IMAGE_SIZE);
+  const yTaps = bicubicTaps(sourceHeight, IMAGE_SIZE);
+  for (let y = 0; y < IMAGE_SIZE; y += 1) {
+    const yTap = yTaps[y];
+    for (let x = 0; x < IMAGE_SIZE; x += 1) {
+      const xTap = xTaps[x];
+      const pixel = y * IMAGE_SIZE + x;
+      for (let channel = 0; channel < CHANNELS; channel += 1) {
+        let value = 0;
+        for (let yIndex = 0; yIndex < yTap.indices.length; yIndex += 1) {
+          let row = 0;
+          const sourceRow = yTap.indices[yIndex] * sourceWidth;
+          for (let xIndex = 0; xIndex < xTap.indices.length; xIndex += 1) {
+            const source = (sourceRow + xTap.indices[xIndex]) * 4;
+            row += rgba[source + channel] * xTap.weights[xIndex];
+          }
+          value += row * yTap.weights[yIndex];
+        }
+        const resized = Math.floor(Math.min(255, Math.max(0, value)) + 0.5);
+        const normalized = resized / 255;
+        tensor[channel * plane + pixel] =
+          (normalized - MEAN[channel]) / STANDARD_DEVIATION[channel];
+      }
     }
   }
   return tensor;
+}
+
+function bicubicTaps(sourceSize, targetSize) {
+  const scale = sourceSize / targetSize;
+  const filterScale = Math.max(scale, 1);
+  const support = 2 * filterScale;
+  const kernelSize = Math.ceil(support) * 2 + 1;
+  if (kernelSize > MAX_RESAMPLE_TAPS) {
+    throw new Error("decoded image dimensions require too many resampling taps");
+  }
+  const taps = [];
+  for (let target = 0; target < targetSize; target += 1) {
+    const center = (target + 0.5) * scale;
+    const start = Math.max(0, Math.floor(center - support + 0.5));
+    const end = Math.min(sourceSize, Math.floor(center + support + 0.5));
+    const indices = [];
+    const weights = [];
+    for (let source = start; source < end; source += 1) {
+      indices.push(source);
+      weights.push(
+        cubicWeight((source - center + 0.5) / filterScale) / filterScale,
+      );
+    }
+    const total = weights.reduce((sum, weight) => sum + weight, 0);
+    taps.push({
+      indices,
+      weights: total === 0 ? weights.map(() => 0) : weights.map((weight) => weight / total),
+    });
+  }
+  return taps;
+}
+
+function cubicWeight(distance) {
+  const absolute = Math.abs(distance);
+  if (absolute <= 1) {
+    return 1.5 * absolute ** 3 - 2.5 * absolute ** 2 + 1;
+  }
+  if (absolute < 2) {
+    return -0.5 * absolute ** 3 + 2.5 * absolute ** 2 - 4 * absolute + 2;
+  }
+  return 0;
 }
 
 function safeMessage(error) {
@@ -288,4 +392,3 @@ function safeMessage(error) {
   const trimmed = message.trim();
   return trimmed ? trimmed.slice(0, 240) : "Local model operation failed.";
 }
-

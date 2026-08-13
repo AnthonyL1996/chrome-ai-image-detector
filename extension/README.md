@@ -1,19 +1,24 @@
-# MV3 extension shell
+# MV3 local detector extension
 
-This directory is a no-backend Manifest V3 scaffold. It discovers ordinary
-`<img>` elements only after the user presses **Scan images on this page** and
-adds an accessible status next to each discovered image.
+This directory contains the Manifest V3 browser surface for the detector. It
+discovers ordinary `<img>` elements only after the user presses **Scan images
+on this page** and adds an accessible status next to each discovered image.
 
-No inference engine or model is bundled yet. Every current result therefore
-states that local confidence is unavailable. The adapter in
-`runtime/model-runtime.mjs` is the boundary for a later audited ONNX Runtime
-Web backend and model bundle. It requires backends to identify themselves as
-local-only.
+The service worker loads a bundled ONNX Runtime Web WASM adapter and the
+`model/detector.onnx` plus `model/metadata.json` bundle when those artifacts
+are installed. The adapter verifies the model digest and fixed input/output
+contract before scoring. If the bundle is absent or fails validation, each
+image receives an explicit local-runtime-unavailable result.
 
-The extension has no host permissions, remote inference, telemetry, or network
-code. Chrome grants temporary access to the active tab when the user invokes
-the extension action.
+Inference stays local to the browser; no image or result is sent to a remote
+inference service and no telemetry is collected. To load ordinary page images
+from the service worker, the first scan asks for optional access to the active
+page origin. The request is per-origin and can be denied; persistent
+`host_permissions` are not declared. For the same-origin privacy boundary,
+images whose URL origin differs from the scanned page are reported unavailable
+instead of being fetched as a privileged cross-origin request.
 
 For local inspection, open `chrome://extensions`, enable Developer mode, choose
-**Load unpacked**, and select this `extension` directory. This is a development
-scaffold, not a working AI detector.
+**Load unpacked**, and select this `extension` directory. This development
+build expects the audited model bundle to be present; the ONNX Runtime Web WASM
+files are vendored under `runtime/vendor/`.

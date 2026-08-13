@@ -188,6 +188,34 @@ test("a tab is reserved before asynchronous scan setup begins", async () => {
   assert.equal((await firstScan).ok, true);
 });
 
+test("a tab is reserved while optional permission setup is pending", async () => {
+  let releasePermission;
+  const permissionGate = new Promise((resolve) => { releasePermission = resolve; });
+  let permissionRequests = 0;
+  const worker = await loadServiceWorker({
+    permissions: {
+      contains: async () => false,
+      request: async () => {
+        permissionRequests += 1;
+        await permissionGate;
+        return true;
+      },
+    },
+  });
+  const popup = {
+    id: "extension-id",
+    url: "chrome-extension://extension-id/popup.html",
+  };
+  const first = worker.dispatch({ type: "SCAN_ACTIVE_TAB" }, popup);
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = await worker.dispatch({ type: "SCAN_ACTIVE_TAB" }, popup);
+  assert.equal(second.ok, false);
+  assert.match(second.error, /already has an active image scan/i);
+  assert.equal(permissionRequests, 1);
+  releasePermission();
+  assert.equal((await first).ok, true);
+});
+
 test("scan requests optional access only for the active page origin", async () => {
   const requested = [];
   const worker = await loadServiceWorker({
@@ -236,4 +264,74 @@ test("scan stops before script injection when optional origin access is denied",
   assert.equal(response.ok, false);
   assert.match(response.error, /access|permission|denied/i);
   assert.deepEqual(worker.calls, []);
+});
+
+test("scoring rejects image URLs outside the scanned page origin", async () => {
+  let dispatch;
+  let scoring;
+  const worker = await loadServiceWorker({
+    tabs: {
+      query: async () => [{ id: 17, url: "https://example.test/article" }],
+      sendMessage: async () => {
+        scoring = await dispatch(
+          {
+            type: "SCORE_IMAGES",
+            images: [{ id: "cross-origin", source: "https://other.test/private.png" }],
+          },
+          { id: "extension-id", tab: { id: 17 }, frameId: 0 },
+        );
+        return { ok: true, count: 1, errors: 1, skipped: 0 };
+      },
+    },
+  });
+  dispatch = worker.dispatch;
+
+  const scan = await dispatch(
+    { type: "SCAN_ACTIVE_TAB" },
+    { id: "extension-id", url: "chrome-extension://extension-id/popup.html" },
+  );
+  assert.deepEqual(scan, { ok: true, count: 1, errors: 1, skipped: 0 });
+  assert.deepEqual(JSON.parse(JSON.stringify(scoring)), {
+    ok: true,
+    results: [{
+      id: "cross-origin",
+      status: "error",
+      code: "IMAGE_ORIGIN_NOT_ALLOWED",
+      message: "Image source origin differs from the active page origin.",
+    }],
+  });
+});
+
+test("scoring keeps same-origin images when one image is cross-origin", async () => {
+  let dispatch;
+  let scoring;
+  const worker = await loadServiceWorker({
+    tabs: {
+      query: async () => [{ id: 17, url: "https://example.test/article" }],
+      sendMessage: async () => {
+        scoring = await dispatch(
+          {
+            type: "SCORE_IMAGES",
+            images: [
+              { id: "same", source: "https://example.test/ok.png" },
+              { id: "cross", source: "https://other.test/private.png" },
+            ],
+          },
+          { id: "extension-id", tab: { id: 17 }, frameId: 0 },
+        );
+        return { ok: true, count: 2, errors: 1, skipped: 0 };
+      },
+    },
+  });
+  dispatch = worker.dispatch;
+  const scan = await dispatch(
+    { type: "SCAN_ACTIVE_TAB" },
+    { id: "extension-id", url: "chrome-extension://extension-id/popup.html" },
+  );
+  assert.deepEqual(scan, { ok: true, count: 2, errors: 1, skipped: 0 });
+  assert.equal(scoring.ok, true);
+  assert.equal(scoring.results.length, 2);
+  assert.equal(scoring.results[0].id, "same");
+  assert.equal(scoring.results[0].status, "error");
+  assert.equal(scoring.results[1].code, "IMAGE_ORIGIN_NOT_ALLOWED");
 });
