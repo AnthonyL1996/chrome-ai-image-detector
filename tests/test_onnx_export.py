@@ -597,7 +597,7 @@ class OnnxExporterTests(unittest.TestCase):
                         model.write_bytes(b"replacement-model")
 
             with patch.object(os, "fsync", replace_model_during_parent_fsync):
-                with self.assertRaisesRegex(RuntimeError, "identity"):
+                with self.assertRaisesRegex(RuntimeError, "changed"):
                     export_detector_onnx(
                         **paths,
                         torch_module=_FakeTorch(),
