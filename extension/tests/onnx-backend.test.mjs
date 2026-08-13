@@ -86,7 +86,7 @@ function dependencies({ session, imageTensor } = {}) {
     ort,
     fetchImpl,
     cryptoImpl,
-    imageTensor: imageTensor || (() => Float32Array.of(0.1)),
+    imageTensor: imageTensor || (() => new Float32Array(3 * 224 * 224)),
     seen,
   };
 }
