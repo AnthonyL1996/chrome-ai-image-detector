@@ -1,10 +1,17 @@
 import hashlib
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from poidh_benchmark.manifest import MirageRow
-from poidh_benchmark.mirage import materialize_entry, pinned_download_url
+from poidh_benchmark.mirage import (
+    commit_staging_directory,
+    git_provenance,
+    materialize_entry,
+    pinned_download_url,
+    validate_materialized_entries,
+)
 
 
 class MirageMaterializationTests(unittest.TestCase):
@@ -81,6 +88,66 @@ class MirageMaterializationTests(unittest.TestCase):
     def test_url_rejects_missing_revision(self) -> None:
         with self.assertRaisesRegex(ValueError, "revision"):
             pinned_download_url("dataset", "", "image.jpg")
+
+    def test_validates_exact_materialized_file_set(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected = root / "real" / "Human" / "expected.jpg"
+            expected.parent.mkdir(parents=True)
+            expected.write_bytes(b"image")
+            entries = [{"local_path": "real/Human/expected.jpg"}]
+
+            validate_materialized_entries(root, entries)
+            extra = root / "ai" / "Human" / "stale.jpg"
+            extra.parent.mkdir(parents=True)
+            extra.write_bytes(b"stale")
+            with self.assertRaisesRegex(RuntimeError, "does not match manifest"):
+                validate_materialized_entries(root, entries)
+
+    def test_commits_staging_only_to_absent_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            staging = parent / "holdout.staging"
+            destination = parent / "holdout"
+            staging.mkdir()
+            (staging / "manifest.json").write_text("{}", encoding="utf-8")
+
+            commit_staging_directory(staging, destination)
+
+            self.assertFalse(staging.exists())
+            self.assertTrue((destination / "manifest.json").is_file())
+            replacement = parent / "replacement.staging"
+            replacement.mkdir()
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                commit_staging_directory(replacement, destination)
+
+    @patch("poidh_benchmark.mirage.subprocess.run")
+    def test_git_provenance_rejects_dirty_worktree(self, run) -> None:
+        run.side_effect = [
+            type("Result", (), {"stdout": "abc123\n"})(),
+            type("Result", (), {"stdout": " M tools/prepare_mirage_holdout.py\n"})(),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "dirty worktree"):
+            git_provenance(Path("/repo"), Path("/repo/tool.py"))
+
+    @patch("poidh_benchmark.mirage.subprocess.run")
+    def test_git_provenance_records_commit_and_script_hash(self, run) -> None:
+        run.side_effect = [
+            type("Result", (), {"stdout": "abc123\n"})(),
+            type("Result", (), {"stdout": ""})(),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory, "tool.py")
+            script.write_bytes(b"print('frozen')\n")
+
+            provenance = git_provenance(Path(directory), script)
+
+        self.assertEqual(provenance["git_commit"], "abc123")
+        self.assertEqual(
+            provenance["script_sha256"],
+            hashlib.sha256(b"print('frozen')\n").hexdigest(),
+        )
 
 
 if __name__ == "__main__":

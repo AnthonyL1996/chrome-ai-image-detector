@@ -7,7 +7,10 @@ import hashlib
 import itertools
 import json
 from pathlib import Path
+import platform
+import shutil
 import sys
+import tempfile
 import time
 from urllib.request import Request, urlopen
 
@@ -17,7 +20,12 @@ from poidh_benchmark.manifest import (  # noqa: E402
     MirageRow,
     select_balanced_generator_strata,
 )
-from poidh_benchmark.mirage import materialize_entry  # noqa: E402
+from poidh_benchmark.mirage import (  # noqa: E402
+    commit_staging_directory,
+    git_provenance,
+    materialize_entry,
+    validate_materialized_entries,
+)
 
 
 DATASET_ID = "Yunncheng/Mirage-Test"
@@ -57,7 +65,14 @@ def main() -> None:
         raise ValueError("workers must be positive")
     if args.exclude_count < 0:
         raise ValueError("exclude-count must not be negative")
+    if args.output_root.exists():
+        raise FileExistsError(f"output destination already exists: {args.output_root}")
 
+    repository = Path(__file__).resolve().parents[1]
+    preparation = git_provenance(repository, Path(__file__).resolve())
+
+    import datasets
+    import huggingface_hub
     from datasets import Image, load_dataset
     from huggingface_hub import hf_hub_download
 
@@ -80,6 +95,7 @@ def main() -> None:
         for item in metadata
     ]
 
+    ordered_excluded_file_names: list[str] = []
     excluded_file_names: set[str] = set()
     if args.exclude_count:
         streamed = load_dataset(
@@ -88,10 +104,14 @@ def main() -> None:
             streaming=True,
             revision=DATASET_REVISION,
         ).cast_column("image", Image(decode=False))
-        shuffled = streamed.shuffle(seed=args.exclude_shuffle_seed)
-        excluded_file_names = {
+        shuffled = streamed.shuffle(
+            seed=args.exclude_shuffle_seed,
+            buffer_size=1_000,
+        )
+        ordered_excluded_file_names = [
             item["file_name"] for item in itertools.islice(shuffled, args.exclude_count)
-        }
+        ]
+        excluded_file_names = set(ordered_excluded_file_names)
         if len(excluded_file_names) != args.exclude_count:
             raise RuntimeError("could not reconstruct the full excluded slice")
 
@@ -104,61 +124,100 @@ def main() -> None:
         seed=SELECTION_SEED,
     )
 
-    images_root = args.output_root / "images"
-    entries: list[dict[str, str | None]] = []
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        pending = {
-            pool.submit(
-                materialize_entry,
-                row,
-                output_root=images_root,
-                dataset_id=DATASET_ID,
-                revision=DATASET_REVISION,
-                selection_seed=SELECTION_SEED,
-                fetch=_download_with_retries,
-            ): row
-            for row in selected
-        }
-        for completed, future in enumerate(as_completed(pending), start=1):
-            entries.append(future.result())
-            if completed % 25 == 0 or completed == len(pending):
-                print(f"Downloaded {completed}/{len(pending)}", flush=True)
-
-    content_hashes = [entry["content_sha256"] for entry in entries]
-    if len(content_hashes) != len(set(content_hashes)):
-        raise RuntimeError("duplicate image content detected in frozen holdout")
-
-    entries.sort(key=lambda entry: str(entry["file_name"]))
-    manifest = {
-        "schema_version": 1,
-        "dataset_id": DATASET_ID,
-        "dataset_revision": DATASET_REVISION,
-        "metadata_file": "test.parquet",
-        "metadata_sha256": metadata_sha256,
-        "selection": {
-            "seed": SELECTION_SEED,
-            "content_types": list(CONTENT_TYPES),
-            "fake_generators": list(FAKE_GENERATORS),
-            "per_class_per_content": args.per_class_per_content,
-            "excluded_development_shuffle_seed": args.exclude_shuffle_seed,
-            "excluded_development_count": len(excluded_file_names),
-            "excluded_file_names": sorted(excluded_file_names),
-        },
-        "counts": {
-            "total": len(entries),
-            "real": sum(entry["label"] == "real" for entry in entries),
-            "ai": sum(entry["label"] == "ai" for entry in entries),
-        },
-        "entries": entries,
-    }
-    args.output_root.mkdir(parents=True, exist_ok=True)
-    manifest_path = args.output_root / "manifest.json"
-    temporary = manifest_path.with_suffix(".json.part")
-    temporary.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    args.output_root.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(
+            prefix=f".{args.output_root.name}.staging-",
+            dir=args.output_root.parent,
+        )
     )
-    temporary.replace(manifest_path)
-    print(f"Wrote {manifest_path}", flush=True)
+    published = False
+    try:
+        images_root = staging_root / "images"
+        entries: list[dict[str, str | None]] = []
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            pending = {
+                pool.submit(
+                    materialize_entry,
+                    row,
+                    output_root=images_root,
+                    dataset_id=DATASET_ID,
+                    revision=DATASET_REVISION,
+                    selection_seed=SELECTION_SEED,
+                    fetch=_download_with_retries,
+                ): row
+                for row in selected
+            }
+            for completed, future in enumerate(as_completed(pending), start=1):
+                entries.append(future.result())
+                if completed % 25 == 0 or completed == len(pending):
+                    print(f"Downloaded {completed}/{len(pending)}", flush=True)
+
+        content_hashes = [entry["content_sha256"] for entry in entries]
+        if len(content_hashes) != len(set(content_hashes)):
+            raise RuntimeError("duplicate image content detected in frozen holdout")
+
+        entries.sort(key=lambda entry: str(entry["file_name"]))
+        validate_materialized_entries(images_root, entries)
+        dataset_card_path = Path(
+            hf_hub_download(
+                DATASET_ID,
+                "README.md",
+                repo_type="dataset",
+                revision=DATASET_REVISION,
+            )
+        )
+        excluded_manifest_sha256 = hashlib.sha256(
+            "\n".join(ordered_excluded_file_names).encode("utf-8")
+        ).hexdigest()
+        manifest = {
+            "schema_version": 1,
+            "dataset_id": DATASET_ID,
+            "dataset_revision": DATASET_REVISION,
+            "metadata_file": "test.parquet",
+            "metadata_sha256": metadata_sha256,
+            "provenance": {
+                "declared_repository_license": "MIT",
+                "dataset_card_sha256": _sha256_file(dataset_card_path),
+                "evaluation_only": True,
+                "redistribute_images": False,
+                "preparation_git_commit": preparation["git_commit"],
+                "preparation_script_sha256": preparation["script_sha256"],
+                "python_version": platform.python_version(),
+                "datasets_version": datasets.__version__,
+                "huggingface_hub_version": huggingface_hub.__version__,
+            },
+            "selection": {
+                "seed": SELECTION_SEED,
+                "content_types": list(CONTENT_TYPES),
+                "fake_generators": list(FAKE_GENERATORS),
+                "per_class_per_content": args.per_class_per_content,
+                "excluded_development_shuffle_seed": args.exclude_shuffle_seed,
+                "excluded_development_shuffle_buffer_size": 1_000,
+                "excluded_development_count": len(excluded_file_names),
+                "excluded_file_names": ordered_excluded_file_names,
+                "excluded_manifest_sha256": excluded_manifest_sha256,
+            },
+            "counts": {
+                "total": len(entries),
+                "real": sum(entry["label"] == "real" for entry in entries),
+                "ai": sum(entry["label"] == "ai" for entry in entries),
+            },
+            "entries": entries,
+        }
+        manifest_path = staging_root / "manifest.json"
+        temporary = manifest_path.with_suffix(".json.part")
+        temporary.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(manifest_path)
+        commit_staging_directory(staging_root, args.output_root)
+        published = True
+        print(f"Wrote {args.output_root / 'manifest.json'}", flush=True)
+    finally:
+        if not published and staging_root.exists():
+            shutil.rmtree(staging_root)
 
 
 def _download_with_retries(url: str) -> bytes:

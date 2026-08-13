@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import re
+import subprocess
 from urllib.parse import quote
 
 from poidh_benchmark.manifest import MirageRow
@@ -72,6 +73,57 @@ def materialize_entry(
         "content_sha256": content_sha256,
         "download_url": download_url,
         "local_path": relative_path.as_posix(),
+    }
+
+
+def validate_materialized_entries(
+    images_root: Path, entries: Iterable[Mapping[str, object]]
+) -> None:
+    expected = {
+        str(entry["local_path"])
+        for entry in entries
+        if isinstance(entry.get("local_path"), str)
+    }
+    actual = {
+        path.relative_to(images_root).as_posix()
+        for path in images_root.rglob("*")
+        if path.is_file()
+    }
+    if expected != actual:
+        missing = sorted(expected - actual)[:3]
+        extra = sorted(actual - expected)[:3]
+        raise RuntimeError(
+            "materialized file set does not match manifest: "
+            f"missing={missing}, extra={extra}"
+        )
+
+
+def commit_staging_directory(staging: Path, destination: Path) -> None:
+    if destination.exists():
+        raise FileExistsError(f"output destination already exists: {destination}")
+    staging.replace(destination)
+
+
+def git_provenance(repository: Path, script_path: Path) -> dict[str, str]:
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    if status:
+        raise RuntimeError("refusing to prepare holdout from a dirty worktree")
+    return {
+        "git_commit": commit,
+        "script_sha256": hashlib.sha256(script_path.read_bytes()).hexdigest(),
     }
 
 
