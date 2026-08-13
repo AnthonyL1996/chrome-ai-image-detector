@@ -18,6 +18,7 @@ from poidh_detector.calibration import (
 )
 from poidh_detector.calibration_fit import CalibrationFitResult, CalibrationMetrics
 from poidh_detector import onnx_export
+from poidh_detector.export import ExportMetadata
 from poidh_detector.model import ConvNeXtV2NanoConfig, create_convnextv2_nano
 from poidh_detector.onnx_export import export_detector_onnx
 from poidh_detector.training import TrainingConfig
@@ -701,29 +702,31 @@ class OnnxExporterTests(unittest.TestCase):
                 staging: Path,
                 destination: Path,
                 metadata: ExportMetadata,
-            ) -> None:
+            ) -> int:
                 nonlocal staging_path, displaced_staging, foreign_file
-                real_publish_bundle(staging, destination, metadata)
+                descriptor = real_publish_bundle(staging, destination, metadata)
                 staging_path = staging
                 displaced_staging = staging.with_name(f"{staging.name}.displaced")
                 staging.rename(displaced_staging)
                 staging.mkdir()
                 foreign_file = staging / "foreign.txt"
                 foreign_file.write_text("foreign", encoding="ascii")
+                return descriptor
 
             with patch.object(
                 onnx_export,
                 "_publish_bundle",
                 replace_staging_after_publication,
             ):
-                export_detector_onnx(
-                    **paths,
-                    torch_module=_FakeTorch(),
-                    timm_module=_FakeTimm(_FakeDetector()),
-                    import_module=lambda name: _FakeOnnx()
-                    if name == "onnx"
-                    else _missing_onnx(name),
-                )
+                with self.assertRaisesRegex(RuntimeError, "identity"):
+                    export_detector_onnx(
+                        **paths,
+                        torch_module=_FakeTorch(),
+                        timm_module=_FakeTimm(_FakeDetector()),
+                        import_module=lambda name: _FakeOnnx()
+                        if name == "onnx"
+                        else _missing_onnx(name),
+                    )
 
             assert staging_path is not None
             assert displaced_staging is not None

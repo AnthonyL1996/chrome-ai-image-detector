@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import errno
 import hashlib
 import importlib
 import io
@@ -8,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import secrets
-import shutil
 import stat
 import tempfile
 from typing import Any
@@ -54,6 +54,7 @@ def export_detector_onnx(
     destination = output.absolute()
     if os.path.lexists(destination):
         raise FileExistsError(f"ONNX export output already exists: {destination}")
+    _require_secure_directory_operations()
 
     checkpoint_payload = _read_regular_file(checkpoint, "checkpoint")
     config_payload = _read_regular_file(training_config, "training config")
@@ -95,6 +96,8 @@ def export_detector_onnx(
     staging = Path(
         tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
     )
+    staging_descriptor = _open_directory(staging)
+    publication_descriptor: int | None = None
     try:
         model_path = staging / _MODEL_NAME
         torch.onnx.export(
@@ -127,11 +130,17 @@ def export_detector_onnx(
         _fsync_file(model_path)
         _fsync_file(metadata_path)
         _fsync_directory(staging)
-        _publish_bundle(staging, destination, metadata)
+        publication_descriptor = _publish_bundle(staging, destination, metadata)
     finally:
-        if staging.exists():
-            shutil.rmtree(staging)
+        try:
+            _cleanup_staging(staging, staging_descriptor)
             _fsync_directory(destination.parent)
+            if publication_descriptor is not None:
+                _require_directory_identity(destination, publication_descriptor)
+        finally:
+            os.close(staging_descriptor)
+            if publication_descriptor is not None:
+                os.close(publication_descriptor)
     return metadata
 
 
@@ -332,7 +341,7 @@ def _load_export_metadata(payload: bytes) -> ExportMetadata:
     return metadata
 
 
-def _publish_bundle(staging: Path, destination: Path, metadata: ExportMetadata) -> None:
+def _publish_bundle(staging: Path, destination: Path, metadata: ExportMetadata) -> int:
     _require_secure_directory_operations()
     try:
         destination.mkdir(mode=0o700)
@@ -343,6 +352,7 @@ def _publish_bundle(staging: Path, destination: Path, metadata: ExportMetadata) 
 
     directory_descriptor = _open_directory(destination)
     ready_temporary: str | None = None
+    published = False
     try:
         _require_directory_identity(destination, directory_descriptor)
         reservation_token = secrets.token_hex(32)
@@ -376,18 +386,25 @@ def _publish_bundle(staging: Path, destination: Path, metadata: ExportMetadata) 
         os.fsync(directory_descriptor)
         _fsync_directory(destination.parent)
         _require_directory_identity(destination, directory_descriptor)
+        published = True
+        return directory_descriptor
     finally:
-        if ready_temporary is not None:
-            try:
-                os.unlink(ready_temporary, dir_fd=directory_descriptor)
-            except FileNotFoundError:
-                pass
-        os.close(directory_descriptor)
+        try:
+            if ready_temporary is not None:
+                try:
+                    os.unlink(ready_temporary, dir_fd=directory_descriptor)
+                except FileNotFoundError:
+                    pass
+        finally:
+            if not published:
+                os.close(directory_descriptor)
 
 
 def _require_secure_directory_operations() -> None:
-    required = (os.open, os.rename, os.unlink)
-    if any(operation not in os.supports_dir_fd for operation in required):
+    required = (os.open, os.rename, os.stat, os.unlink)
+    if os.listdir not in os.supports_fd or any(
+        operation not in os.supports_dir_fd for operation in required
+    ):
         raise RuntimeError(
             "secure ONNX publication requires directory-relative filesystem operations"
         )
@@ -429,6 +446,20 @@ def _write_file_at(directory_descriptor: int, name: str, payload: bytes) -> None
 
 def _move_file_at(source: Path, directory_descriptor: int, name: str) -> None:
     os.rename(source, name, dst_dir_fd=directory_descriptor)
+
+
+def _cleanup_staging(staging: Path, directory_descriptor: int) -> None:
+    _require_directory_identity(staging, directory_descriptor)
+    for name in os.listdir(directory_descriptor):
+        entry = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        if stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
+            os.unlink(name, dir_fd=directory_descriptor)
+    _require_directory_identity(staging, directory_descriptor)
+    try:
+        os.rmdir(staging)
+    except OSError as error:
+        if error.errno != errno.ENOTEMPTY:
+            raise
 
 
 def _onnx_tensor(value: Any, onnx: Any) -> OnnxTensor:
