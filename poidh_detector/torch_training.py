@@ -401,7 +401,7 @@ def publish_generation(
         manifest_path.write_bytes(manifest.to_json_bytes())
         _fsync_file(manifest_path)
         ready_path = staging / "READY"
-        ready_path.write_text(manifest.sha256 + "\n", encoding="ascii")
+        ready_path.write_bytes((manifest.sha256 + "\n").encode("ascii"))
         _fsync_file(ready_path)
         _fsync_directory(staging, os_name=os_name)
         _interrupt(interruption_hook, "after_artifacts")

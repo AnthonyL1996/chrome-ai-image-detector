@@ -207,6 +207,10 @@ class TransactionalRunTests(unittest.TestCase):
 
             self.assertTrue((output / "CURRENT").is_file())
             self.assertTrue(published.path.is_dir())
+            self.assertEqual(
+                (published.path / "READY").read_bytes(),
+                (published.manifest.sha256 + "\n").encode("ascii"),
+            )
             self.assertEqual(file_fsync.call_count, 5)
 
     def test_posix_directory_fsync_opens_syncs_and_closes_directory(self) -> None:
