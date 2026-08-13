@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
+import tomllib
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -13,6 +17,8 @@ from poidh_detector.calibration import (
     PlattCalibrationArtifact,
 )
 from poidh_detector.calibration_fit import CalibrationFitResult, CalibrationMetrics
+from poidh_detector import onnx_export
+from poidh_detector.model import ConvNeXtV2NanoConfig, create_convnextv2_nano
 from poidh_detector.onnx_export import export_detector_onnx
 from poidh_detector.training import TrainingConfig
 from tools.export_detector_onnx import main
@@ -106,10 +112,13 @@ class _FakeTorch:
     def __init__(self, *, create_external_data: bool = False) -> None:
         self.nn = SimpleNamespace(Module=_FakeModule)
         self.onnx = _FakeOnnxExporter(create_external_data=create_external_data)
-        self.load_calls: list[tuple[Path, str, bool]] = []
+        self.load_calls: list[tuple[object, str, bool]] = []
+        self.loaded_payloads: list[bytes | None] = []
 
-    def load(self, path: Path, *, map_location: str, weights_only: bool) -> object:
-        self.load_calls.append((path, map_location, weights_only))
+    def load(self, source: object, *, map_location: str, weights_only: bool) -> object:
+        self.load_calls.append((source, map_location, weights_only))
+        read = getattr(source, "read", None)
+        self.loaded_payloads.append(read() if callable(read) else None)
         return {"head.weight": _Expression("weights")}
 
     def tensor(self, value: float, *, dtype: object) -> _Expression:
@@ -266,6 +275,7 @@ class OnnxExporterTests(unittest.TestCase):
                 {
                     paths["output"] / "detector.onnx",
                     paths["output"] / "metadata.json",
+                    paths["output"] / "READY",
                 },
             )
             self.assertEqual(
@@ -284,6 +294,14 @@ class OnnxExporterTests(unittest.TestCase):
                 self.assertEqual(
                     document[field], _sha256(paths[path_name].read_bytes())
                 )
+            self.assertEqual(
+                document["model_sha256"],
+                _sha256((paths["output"] / "detector.onnx").read_bytes()),
+            )
+            self.assertEqual(
+                (paths["output"] / "READY").read_bytes(),
+                (_sha256(metadata.to_json_bytes()) + "\n").encode("ascii"),
+            )
 
             self.assertEqual(
                 timm.calls,
@@ -294,7 +312,9 @@ class OnnxExporterTests(unittest.TestCase):
                     )
                 ],
             )
-            self.assertEqual(torch.load_calls, [(paths["checkpoint"], "cpu", True)])
+            self.assertEqual(len(torch.load_calls), 1)
+            self.assertIsInstance(torch.load_calls[0][0], io.BytesIO)
+            self.assertEqual(torch.loaded_payloads, [paths["checkpoint"].read_bytes()])
             self.assertEqual(
                 detector.loaded, ({"head.weight": unittest.mock.ANY}, True)
             )
@@ -341,6 +361,24 @@ class OnnxExporterTests(unittest.TestCase):
 
             self.assertEqual(len(onnx.checked), 1)
             self.assertTrue(onnx.checked[0][1])
+
+    def test_requires_onnx_before_loading_the_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            torch = _FakeTorch()
+            timm = _FakeTimm(_FakeDetector())
+
+            with self.assertRaisesRegex(RuntimeError, "onnx.*training extras"):
+                export_detector_onnx(
+                    **paths,
+                    torch_module=torch,
+                    timm_module=timm,
+                    import_module=_missing_onnx,
+                )
+
+            self.assertEqual(torch.load_calls, [])
+            self.assertEqual(timm.calls, [])
+            self.assertFalse(paths["output"].exists())
 
     def test_fails_closed_on_provenance_mismatch_before_loading_weights(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -396,6 +434,80 @@ class OnnxExporterTests(unittest.TestCase):
                 )
             self.assertFalse(external_paths["output"].exists())
 
+    def test_atomic_reservation_does_not_clobber_a_concurrent_destination(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            destination = paths["output"].absolute()
+            real_mkdir = Path.mkdir
+            injected = False
+
+            def mkdir_with_collision(
+                path: Path,
+                mode: int = 0o777,
+                parents: bool = False,
+                exist_ok: bool = False,
+            ) -> None:
+                nonlocal injected
+                if path.absolute() == destination and not injected:
+                    injected = True
+                    real_mkdir(path)
+                real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+            with patch.object(Path, "mkdir", mkdir_with_collision):
+                with self.assertRaisesRegex(FileExistsError, "already exists"):
+                    export_detector_onnx(
+                        **paths,
+                        torch_module=_FakeTorch(),
+                        timm_module=_FakeTimm(_FakeDetector()),
+                        import_module=lambda name: _FakeOnnx()
+                        if name == "onnx"
+                        else _missing_onnx(name),
+                    )
+
+            self.assertTrue(injected)
+            self.assertEqual(list(destination.iterdir()), [])
+
+    def test_fsyncs_bundle_and_detects_model_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            with patch.object(os, "fsync", wraps=os.fsync) as fsync:
+                metadata = export_detector_onnx(
+                    **paths,
+                    torch_module=_FakeTorch(),
+                    timm_module=_FakeTimm(_FakeDetector()),
+                    import_module=lambda name: _FakeOnnx()
+                    if name == "onnx"
+                    else _missing_onnx(name),
+                )
+
+            self.assertGreaterEqual(fsync.call_count, 4)
+            self.assertEqual(
+                onnx_export.validate_export_bundle(paths["output"]), metadata
+            )
+            with (paths["output"] / "detector.onnx").open("ab") as stream:
+                stream.write(b"mutated")
+            with self.assertRaisesRegex(ValueError, "model digest mismatch"):
+                onnx_export.validate_export_bundle(paths["output"])
+
+    def test_windows_directory_fsync_is_a_supported_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(os, "fsync") as fsync:
+                onnx_export._fsync_directory(Path(temporary), os_name="nt")
+            fsync.assert_not_called()
+
+    def test_training_extra_declares_real_export_dependencies(self) -> None:
+        document = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+        requirements = document["project"]["optional-dependencies"]["training"]
+        normalized = {
+            requirement.split("<", 1)[0].split(">", 1)[0]
+            for requirement in requirements
+        }
+
+        self.assertIn("onnx", normalized)
+        self.assertIn("onnxruntime", normalized)
+
     @patch("tools.export_detector_onnx.export_detector_onnx")
     def test_cli_forwards_all_frozen_inputs(self, export: MagicMock) -> None:
         arguments = [
@@ -426,6 +538,83 @@ class OnnxExporterTests(unittest.TestCase):
             license_policy=Path("license-policy.json"),
             output=Path("onnx-export"),
         )
+
+
+_REAL_EXPORT_DEPENDENCIES = ("numpy", "onnx", "onnxruntime", "timm", "torch")
+
+
+@unittest.skipUnless(
+    all(
+        importlib.util.find_spec(name) is not None for name in _REAL_EXPORT_DEPENDENCIES
+    ),
+    "requires the optional training/export dependencies",
+)
+class RealOnnxIntegrationTests(unittest.TestCase):
+    def test_real_export_matches_pytorch_and_detects_model_mutation(self) -> None:
+        import numpy as np
+        import onnx
+        import onnxruntime
+        import torch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = OnnxExporterTests()._inputs(root)
+            torch.manual_seed(323)
+            source = create_convnextv2_nano(ConvNeXtV2NanoConfig()).eval()
+            torch.save(source.state_dict(), paths["checkpoint"])
+            checkpoint_sha256 = _sha256(paths["checkpoint"].read_bytes())
+            config = _config(paths["dataset_manifest"].read_bytes())
+            calibration = CalibrationFitResult(
+                artifact=PlattCalibrationArtifact(
+                    scale=1.75,
+                    bias=-0.25,
+                    checkpoint_sha256=checkpoint_sha256,
+                    calibration_split_sha256=config.calibration_split_sha256,
+                    training_config=config,
+                    input_identifier="calibration",
+                    sample_count=4,
+                    class_counts=CalibrationClassCounts(real=2, ai=2),
+                ),
+                predictions_sha256="e" * 64,
+                uncalibrated=CalibrationMetrics(0.7, 0.2, 0.5),
+                calibrated=CalibrationMetrics(0.6, 0.1, 0.75),
+            )
+            paths["calibrator"].write_bytes(calibration.to_json_bytes())
+
+            metadata = export_detector_onnx(**paths)
+            model_path = paths["output"] / "detector.onnx"
+            graph = onnx.load(str(model_path), load_external_data=False)
+            onnx.checker.check_model(graph, full_check=True)
+            self.assertFalse(
+                any(
+                    initializer.data_location == onnx.TensorProto.EXTERNAL
+                    or initializer.external_data
+                    for initializer in graph.graph.initializer
+                )
+            )
+            self.assertEqual(metadata.model_sha256, _sha256(model_path.read_bytes()))
+
+            image = (
+                np.random.default_rng(323)
+                .normal(size=(1, 3, 224, 224))
+                .astype(np.float32)
+            )
+            with torch.no_grad():
+                raw_logit = source(torch.from_numpy(image)).reshape(1, 1)
+                expected = torch.sigmoid(1.75 * raw_logit - 0.25).numpy()
+            session = onnxruntime.InferenceSession(
+                str(model_path), providers=["CPUExecutionProvider"]
+            )
+            actual = session.run(["probability_ai"], {"image": image})[0]
+            np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+            self.assertEqual(
+                onnx_export.validate_export_bundle(paths["output"]), metadata
+            )
+
+            with model_path.open("ab") as stream:
+                stream.write(b"mutation")
+            with self.assertRaisesRegex(ValueError, "model digest mismatch"):
+                onnx_export.validate_export_bundle(paths["output"])
 
 
 if __name__ == "__main__":

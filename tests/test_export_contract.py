@@ -25,6 +25,7 @@ def _metadata(**overrides: object) -> ExportMetadata:
         "code_sha256": "4" * 64,
         "dataset_manifest_sha256": "5" * 64,
         "license_policy_sha256": "6" * 64,
+        "model_sha256": "7" * 64,
     }
     values.update(overrides)
     return ExportMetadata(**values)  # type: ignore[arg-type]
@@ -100,6 +101,7 @@ class OnnxExportContractTests(unittest.TestCase):
             "code_sha256",
             "dataset_manifest_sha256",
             "license_policy_sha256",
+            "model_sha256",
         )
         for field_name in fields:
             for invalid in ("f" * 63, "F" * 64, True):
@@ -138,6 +140,7 @@ class OnnxExportContractTests(unittest.TestCase):
             "code_sha256",
             "dataset_manifest_sha256",
             "license_policy_sha256",
+            "model_sha256",
         ):
             self.assertIn(field_name, document)
 
