@@ -24,14 +24,21 @@ class Prediction:
             raise ValueError("sample_id must not be empty")
         if self.label not in (0, 1):
             raise ValueError("label must be 0 (real) or 1 (AI)")
-        if not math.isfinite(self.probability_ai) or not 0.0 <= self.probability_ai <= 1.0:
+        if (
+            not math.isfinite(self.probability_ai)
+            or not 0.0 <= self.probability_ai <= 1.0
+        ):
             raise ValueError("probability_ai must be finite and between 0 and 1")
         if not self.source:
             raise ValueError("source must not be empty")
         if self.content_sha256 is not None:
             digest = self.content_sha256.lower()
-            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
-                raise ValueError("content_sha256 must be a 64-character hexadecimal digest")
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError(
+                    "content_sha256 must be a 64-character hexadecimal digest"
+                )
         for field_name, value in (
             ("provenance_group", self.provenance_group),
             ("generator_family", self.generator_family),
@@ -95,7 +102,11 @@ def fit_platt_calibrator(
 ) -> PlattCalibrator:
     if not math.isfinite(learning_rate) or learning_rate <= 0.0:
         raise ValueError("learning_rate must be finite and positive")
-    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0:
+    if (
+        isinstance(iterations, bool)
+        or not isinstance(iterations, int)
+        or iterations <= 0
+    ):
         raise ValueError("iterations must be a positive integer")
     rows = list(predictions)
     _require_unique_sample_ids(rows, split_name="calibration")
@@ -272,9 +283,7 @@ def _reject_metadata_leakage(
         if (value := getattr(row, field_name)) is not None
     }
     holdout_values = {
-        value
-        for row in holdout_rows
-        if (value := getattr(row, field_name)) is not None
+        value for row in holdout_rows if (value := getattr(row, field_name)) is not None
     }
     overlap = calibration_values & holdout_values
     if overlap:

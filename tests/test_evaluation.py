@@ -27,7 +27,9 @@ class BalancedAccuracyTests(unittest.TestCase):
         self.assertEqual(result.balanced_accuracy, 0.5)
         self.assertEqual((result.tn, result.fp, result.fn, result.tp), (1, 1, 1, 1))
 
-    def test_rejects_missing_class_instead_of_reporting_a_misleading_score(self) -> None:
+    def test_rejects_missing_class_instead_of_reporting_a_misleading_score(
+        self,
+    ) -> None:
         rows = [Prediction("only-real", 0, 0.1, "camera")]
 
         with self.assertRaisesRegex(ValueError, "both real and AI"):
@@ -126,7 +128,9 @@ class CalibrationContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "generator-family leakage"):
             evaluate_holdout(calibration, holdout, require_generator_disjoint=True)
 
-    def test_calibration_corrects_shifted_scores_at_fixed_bounty_threshold(self) -> None:
+    def test_calibration_corrects_shifted_scores_at_fixed_bounty_threshold(
+        self,
+    ) -> None:
         calibration = [
             Prediction("r1", 0, 0.25, "camera"),
             Prediction("r2", 0, 0.35, "camera"),
