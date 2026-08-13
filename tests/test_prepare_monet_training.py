@@ -202,9 +202,11 @@ class PrepareMonetTrainingTests(unittest.TestCase):
                         row["license"] = "cc-by-4.0"
                     return [row]
 
-            parquet.read_table = (  # type: ignore[attr-defined]
-                lambda path, *, columns: Table(str(path))
-            )
+            def read_table(path: str, *, columns: object) -> Table:
+                self.assertIsInstance(columns, list)
+                return Table(str(path))
+
+            parquet.read_table = read_table  # type: ignore[attr-defined]
             pyarrow = ModuleType("pyarrow")
             pyarrow.parquet = parquet  # type: ignore[attr-defined]
 

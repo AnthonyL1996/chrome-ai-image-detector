@@ -196,7 +196,7 @@ def _load_candidates(
                 revision=DATASET_REVISION,
                 cache_dir=cache_dir,
             )
-            table = parquet.read_table(local_path, columns=PARQUET_COLUMNS)
+            table = parquet.read_table(local_path, columns=list(PARQUET_COLUMNS))
             source_rows.extend(
                 _parse_rows(
                     table.to_pylist(),
