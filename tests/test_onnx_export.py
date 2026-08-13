@@ -445,22 +445,24 @@ class OnnxExporterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             paths = self._inputs(Path(temporary))
             destination = paths["output"].absolute()
-            real_mkdir = Path.mkdir
+            real_rename = onnx_export._rename_directory_no_replace
             injected = False
 
-            def mkdir_with_collision(
-                path: Path,
-                mode: int = 0o777,
-                parents: bool = False,
-                exist_ok: bool = False,
+            def rename_with_collision(
+                parent_descriptor: int,
+                source_name: str,
+                destination_name: str,
             ) -> None:
                 nonlocal injected
-                if path.absolute() == destination and not injected:
-                    injected = True
-                    real_mkdir(path)
-                real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+                injected = True
+                destination.mkdir()
+                real_rename(parent_descriptor, source_name, destination_name)
 
-            with patch.object(Path, "mkdir", mkdir_with_collision):
+            with patch.object(
+                onnx_export,
+                "_rename_directory_no_replace",
+                rename_with_collision,
+            ):
                 with self.assertRaisesRegex(FileExistsError, "already exists"):
                     export_detector_onnx(
                         **paths,
@@ -497,43 +499,44 @@ class OnnxExporterTests(unittest.TestCase):
                 onnx_export.validate_export_bundle(paths["output"])
 
     def test_cleanup_never_deletes_replaced_destination(self) -> None:
-        for replacement_stage in ("before-token", "after-token"):
+        for replacement_stage in ("before-rename", "after-rename"):
             with self.subTest(replacement_stage=replacement_stage):
                 with tempfile.TemporaryDirectory() as temporary:
                     paths = self._inputs(Path(temporary))
                     destination = paths["output"].absolute()
                     displaced = destination.with_name("displaced-export")
+                    foreign_file = destination / "foreign.txt"
+                    real_rename = onnx_export._rename_directory_no_replace
 
-                    def replace_destination() -> None:
+                    def replace_around_rename(
+                        parent_descriptor: int,
+                        source_name: str,
+                        destination_name: str,
+                    ) -> None:
+                        if replacement_stage == "before-rename":
+                            destination.mkdir()
+                            foreign_file.write_text("foreign", encoding="ascii")
+                            real_rename(
+                                parent_descriptor, source_name, destination_name
+                            )
+                            return
+                        real_rename(parent_descriptor, source_name, destination_name)
                         destination.rename(displaced)
                         destination.mkdir()
+                        foreign_file.write_text("foreign", encoding="ascii")
+                        raise RuntimeError("fault after rename")
 
-                    real_write_file_at = onnx_export._write_file_at
-
-                    def fail_after_token(
-                        descriptor: int, name: str, payload: bytes
-                    ) -> None:
-                        if name == ".reservation":
-                            replace_destination()
-                            raise RuntimeError("fault after token")
-                        real_write_file_at(descriptor, name, payload)
-
-                    if replacement_stage == "before-token":
-
-                        def fail_before_token(_: int) -> str:
-                            replace_destination()
-                            raise RuntimeError("fault before token")
-
-                        failure = patch.object(
-                            onnx_export.secrets, "token_hex", fail_before_token
+                    with patch.object(
+                        onnx_export,
+                        "_rename_directory_no_replace",
+                        replace_around_rename,
+                    ):
+                        expected = (
+                            FileExistsError
+                            if replacement_stage == "before-rename"
+                            else RuntimeError
                         )
-                    else:
-                        failure = patch.object(
-                            onnx_export, "_write_file_at", fail_after_token
-                        )
-
-                    with failure:
-                        with self.assertRaisesRegex(RuntimeError, "fault"):
+                        with self.assertRaises(expected):
                             export_detector_onnx(
                                 **paths,
                                 torch_module=_FakeTorch(),
@@ -544,8 +547,10 @@ class OnnxExporterTests(unittest.TestCase):
                             )
 
                     self.assertTrue(destination.is_dir())
-                    self.assertEqual(list(destination.iterdir()), [])
-                    self.assertTrue(displaced.is_dir())
+                    self.assertEqual(
+                        foreign_file.read_text(encoding="ascii"), "foreign"
+                    )
+                    self.assertFalse((destination / "READY").exists())
 
     def test_publication_does_not_write_into_destination_replaced_during_token(
         self,
@@ -557,13 +562,12 @@ class OnnxExporterTests(unittest.TestCase):
             foreign_model = destination / "detector.onnx"
 
             def replace_destination(_: int) -> str:
-                destination.rename(displaced)
                 destination.mkdir()
                 foreign_model.write_bytes(b"foreign-model")
                 return "a" * 64
 
             with patch.object(onnx_export.secrets, "token_hex", replace_destination):
-                with self.assertRaisesRegex(RuntimeError, "identity"):
+                with self.assertRaisesRegex(FileExistsError, "already exists"):
                     export_detector_onnx(
                         **paths,
                         torch_module=_FakeTorch(),
@@ -575,7 +579,7 @@ class OnnxExporterTests(unittest.TestCase):
 
             self.assertEqual(foreign_model.read_bytes(), b"foreign-model")
             self.assertFalse((destination / "READY").exists())
-            self.assertTrue(displaced.is_dir())
+            self.assertFalse(displaced.exists())
 
     def test_publication_does_not_acquire_a_destination_replaced_after_mkdir(
         self,
@@ -623,13 +627,13 @@ class OnnxExporterTests(unittest.TestCase):
             displaced = destination.with_name("displaced-export")
             foreign_file = destination / "foreign.txt"
             real_require_identity = onnx_export._require_directory_identity
-            identity_checks = 0
+            replaced = False
 
             def replace_after_identity(path: Path, descriptor: int) -> None:
-                nonlocal identity_checks
+                nonlocal replaced
                 real_require_identity(path, descriptor)
-                identity_checks += 1
-                if identity_checks == 4:
+                if path == destination and not replaced:
+                    replaced = True
                     destination.rename(displaced)
                     destination.mkdir()
                     foreign_file.write_text("foreign", encoding="ascii")
@@ -659,24 +663,25 @@ class OnnxExporterTests(unittest.TestCase):
             destination = paths["output"].absolute()
             displaced = destination.with_name("displaced-export")
             foreign_file = destination / "foreign.txt"
-            real_fsync_directory = onnx_export._fsync_directory
-            parent_syncs = 0
+            real_fsync = os.fsync
+            replaced = False
 
-            def replace_during_final_parent_fsync(path: Path, **kwargs: object) -> None:
-                nonlocal parent_syncs
-                real_fsync_directory(path, **kwargs)
-                if path == destination.parent:
-                    parent_syncs += 1
-                    if parent_syncs == 2:
+            def replace_during_final_parent_fsync(descriptor: int) -> None:
+                nonlocal replaced
+                real_fsync(descriptor)
+                if destination.exists() and not replaced:
+                    parent_stat = os.stat(destination.parent)
+                    descriptor_stat = os.fstat(descriptor)
+                    if (parent_stat.st_dev, parent_stat.st_ino) == (
+                        descriptor_stat.st_dev,
+                        descriptor_stat.st_ino,
+                    ):
+                        replaced = True
                         destination.rename(displaced)
                         destination.mkdir()
                         foreign_file.write_text("foreign", encoding="ascii")
 
-            with patch.object(
-                onnx_export,
-                "_fsync_directory",
-                replace_during_final_parent_fsync,
-            ):
+            with patch.object(os, "fsync", replace_during_final_parent_fsync):
                 with self.assertRaisesRegex(RuntimeError, "identity"):
                     export_detector_onnx(
                         **paths,
@@ -688,7 +693,7 @@ class OnnxExporterTests(unittest.TestCase):
                     )
 
             self.assertEqual(foreign_file.read_text(encoding="ascii"), "foreign")
-            self.assertTrue((displaced / "READY").is_file())
+            self.assertFalse((displaced / "READY").exists())
 
     def test_publication_fails_if_destination_is_replaced_during_staging_cleanup(
         self,
@@ -698,24 +703,26 @@ class OnnxExporterTests(unittest.TestCase):
             destination = paths["output"].absolute()
             displaced = destination.with_name("displaced-export")
             foreign_file = destination / "foreign.txt"
-            real_fsync_directory = onnx_export._fsync_directory
-            parent_syncs = 0
+            real_fsync = os.fsync
+            published_parent_syncs = 0
 
-            def replace_during_staging_cleanup(path: Path, **kwargs: object) -> None:
-                nonlocal parent_syncs
-                real_fsync_directory(path, **kwargs)
-                if path == destination.parent:
-                    parent_syncs += 1
-                    if parent_syncs == 3:
+            def replace_during_staging_cleanup(descriptor: int) -> None:
+                nonlocal published_parent_syncs
+                real_fsync(descriptor)
+                if destination.exists():
+                    parent_stat = os.stat(destination.parent)
+                    descriptor_stat = os.fstat(descriptor)
+                    if (parent_stat.st_dev, parent_stat.st_ino) == (
+                        descriptor_stat.st_dev,
+                        descriptor_stat.st_ino,
+                    ):
+                        published_parent_syncs += 1
+                    if published_parent_syncs == 2:
                         destination.rename(displaced)
                         destination.mkdir()
                         foreign_file.write_text("foreign", encoding="ascii")
 
-            with patch.object(
-                onnx_export,
-                "_fsync_directory",
-                replace_during_staging_cleanup,
-            ):
+            with patch.object(os, "fsync", replace_during_staging_cleanup):
                 with self.assertRaisesRegex(RuntimeError, "identity"):
                     export_detector_onnx(
                         **paths,
@@ -737,25 +744,22 @@ class OnnxExporterTests(unittest.TestCase):
             foreign_file: Path | None = None
             real_publish_bundle = onnx_export._publish_bundle
 
-            def replace_staging_after_publication(
-                staging: Path,
-                destination: Path,
-                metadata: ExportMetadata,
+            def replace_staging_before_publication(
+                staging: Path, *arguments: object
             ) -> int:
                 nonlocal staging_path, displaced_staging, foreign_file
-                descriptor = real_publish_bundle(staging, destination, metadata)
                 staging_path = staging
                 displaced_staging = staging.with_name(f"{staging.name}.displaced")
                 staging.rename(displaced_staging)
                 staging.mkdir()
                 foreign_file = staging / "foreign.txt"
                 foreign_file.write_text("foreign", encoding="ascii")
-                return descriptor
+                return real_publish_bundle(staging, *arguments)
 
             with patch.object(
                 onnx_export,
                 "_publish_bundle",
-                replace_staging_after_publication,
+                replace_staging_before_publication,
             ):
                 with self.assertRaisesRegex(RuntimeError, "identity"):
                     export_detector_onnx(
@@ -824,6 +828,52 @@ class OnnxExporterTests(unittest.TestCase):
             self.assertTrue(displaced_staging.is_dir())
             self.assertFalse((destination / "READY").exists())
 
+    def test_publication_strips_ready_from_source_replaced_at_atomic_rename(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            destination = paths["output"].absolute()
+            foreign_model = destination / "detector.onnx"
+            displaced_staging: Path | None = None
+            real_rename = onnx_export._rename_directory_no_replace
+
+            def replace_source_at_rename(
+                parent_descriptor: int,
+                source_name: str,
+                destination_name: str,
+            ) -> None:
+                nonlocal displaced_staging
+                parent = destination.parent
+                source = parent / source_name
+                displaced_staging = source.with_name(f"{source.name}.displaced")
+                source.rename(displaced_staging)
+                source.mkdir()
+                (source / "detector.onnx").write_bytes(b"foreign-model")
+                (source / "metadata.json").write_bytes(b"foreign-metadata")
+                (source / "READY").write_bytes(b"foreign-ready")
+                real_rename(parent_descriptor, source_name, destination_name)
+
+            with patch.object(
+                onnx_export,
+                "_rename_directory_no_replace",
+                replace_source_at_rename,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity"):
+                    export_detector_onnx(
+                        **paths,
+                        torch_module=_FakeTorch(),
+                        timm_module=_FakeTimm(_FakeDetector()),
+                        import_module=lambda name: _FakeOnnx()
+                        if name == "onnx"
+                        else _missing_onnx(name),
+                    )
+
+            assert displaced_staging is not None
+            self.assertEqual(foreign_model.read_bytes(), b"foreign-model")
+            self.assertFalse((destination / "READY").exists())
+            self.assertTrue(displaced_staging.is_dir())
+
     def test_staging_cleanup_does_not_remove_an_empty_replacement_directory(
         self,
     ) -> None:
@@ -831,35 +881,30 @@ class OnnxExporterTests(unittest.TestCase):
             paths = self._inputs(Path(temporary))
             staging_path: Path | None = None
             displaced_staging: Path | None = None
-            staging_identity_checks = 0
-            real_require_identity = onnx_export._require_directory_identity
+            real_publish_bundle = onnx_export._publish_bundle
 
-            def replace_after_final_staging_identity(
-                path: Path, descriptor: int
-            ) -> None:
-                nonlocal staging_path, displaced_staging, staging_identity_checks
-                real_require_identity(path, descriptor)
-                if path.name.startswith(".export."):
-                    staging_identity_checks += 1
-                    if staging_identity_checks == 3:
-                        staging_path = path
-                        displaced_staging = path.with_name(f"{path.name}.displaced")
-                        path.rename(displaced_staging)
-                        path.mkdir()
+            def replace_with_empty_staging(staging: Path, *arguments: object) -> int:
+                nonlocal staging_path, displaced_staging
+                staging_path = staging
+                displaced_staging = staging.with_name(f"{staging.name}.displaced")
+                staging.rename(displaced_staging)
+                staging.mkdir()
+                return real_publish_bundle(staging, *arguments)
 
             with patch.object(
                 onnx_export,
-                "_require_directory_identity",
-                replace_after_final_staging_identity,
+                "_publish_bundle",
+                replace_with_empty_staging,
             ):
-                export_detector_onnx(
-                    **paths,
-                    torch_module=_FakeTorch(),
-                    timm_module=_FakeTimm(_FakeDetector()),
-                    import_module=lambda name: _FakeOnnx()
-                    if name == "onnx"
-                    else _missing_onnx(name),
-                )
+                with self.assertRaisesRegex(RuntimeError, "identity"):
+                    export_detector_onnx(
+                        **paths,
+                        torch_module=_FakeTorch(),
+                        timm_module=_FakeTimm(_FakeDetector()),
+                        import_module=lambda name: _FakeOnnx()
+                        if name == "onnx"
+                        else _missing_onnx(name),
+                    )
 
             assert staging_path is not None
             assert displaced_staging is not None
