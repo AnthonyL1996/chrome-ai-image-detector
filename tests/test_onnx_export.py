@@ -574,6 +574,44 @@ class OnnxExporterTests(unittest.TestCase):
             quarantine = _quarantined_export(destination)
             self.assertFalse((quarantine / "READY").exists())
 
+    def test_model_replacement_during_parent_fsync_cannot_publish_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            destination = paths["output"].absolute()
+            real_fsync = os.fsync
+            replaced = False
+
+            def replace_model_during_parent_fsync(descriptor: int) -> None:
+                nonlocal replaced
+                real_fsync(descriptor)
+                if destination.exists() and not replaced:
+                    parent_stat = os.stat(destination.parent)
+                    descriptor_stat = os.fstat(descriptor)
+                    if (parent_stat.st_dev, parent_stat.st_ino) == (
+                        descriptor_stat.st_dev,
+                        descriptor_stat.st_ino,
+                    ):
+                        replaced = True
+                        model = destination / "detector.onnx"
+                        model.rename(destination / ".verified-model")
+                        model.write_bytes(b"replacement-model")
+
+            with patch.object(os, "fsync", replace_model_during_parent_fsync):
+                with self.assertRaisesRegex(RuntimeError, "identity"):
+                    export_detector_onnx(
+                        **paths,
+                        torch_module=_FakeTorch(),
+                        timm_module=_FakeTimm(_FakeDetector()),
+                        import_module=lambda name: _FakeOnnx()
+                        if name == "onnx"
+                        else _missing_onnx(name),
+                    )
+
+            self.assertTrue(replaced)
+            self.assertFalse(destination.exists())
+            quarantine = _quarantined_export(destination)
+            self.assertFalse((quarantine / "READY").exists())
+
     def test_cleanup_never_deletes_replaced_destination(self) -> None:
         for replacement_stage in ("before-rename", "after-rename"):
             with self.subTest(replacement_stage=replacement_stage):
