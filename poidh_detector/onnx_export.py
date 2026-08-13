@@ -34,6 +34,8 @@ from poidh_detector.training import TrainingConfig
 _MODEL_NAME = "detector.onnx"
 _METADATA_NAME = "metadata.json"
 _READY_NAME = "READY"
+_STAGED_ENTRY_NAMES = frozenset({_MODEL_NAME, _METADATA_NAME})
+_PUBLISHED_ENTRY_NAMES = _STAGED_ENTRY_NAMES | {_READY_NAME}
 _INPUT_SHAPE = (1, 3, 224, 224)
 _OUTPUT_SHAPE = (1, 1)
 
@@ -381,6 +383,7 @@ def _publish_bundle(
             model_descriptor,
             metadata_descriptor,
             metadata,
+            _STAGED_ENTRY_NAMES,
         )
         _require_directory_identity(staging, staging_descriptor)
         _verify_staged_bundle(
@@ -388,7 +391,10 @@ def _publish_bundle(
             model_descriptor,
             metadata_descriptor,
             metadata,
+            _STAGED_ENTRY_NAMES,
         )
+        os.fsync(model_descriptor)
+        os.fsync(metadata_descriptor)
         os.fsync(staging_descriptor)
 
         _rename_directory_no_replace(
@@ -407,6 +413,7 @@ def _publish_bundle(
                 model_descriptor,
                 metadata_descriptor,
                 metadata,
+                _STAGED_ENTRY_NAMES,
             )
             ready_payload = (_sha256(metadata.to_json_bytes()) + "\n").encode("ascii")
             ready_temporary = f".{_READY_NAME}.{reservation_token}.tmp"
@@ -426,6 +433,7 @@ def _publish_bundle(
                 model_descriptor,
                 metadata_descriptor,
                 metadata,
+                _PUBLISHED_ENTRY_NAMES,
             )
             publication_descriptor = os.dup(staging_descriptor)
         except BaseException:
@@ -526,7 +534,10 @@ def _verify_staged_bundle(
     model_descriptor: int,
     metadata_descriptor: int,
     metadata: ExportMetadata,
+    expected_entries: frozenset[str],
 ) -> None:
+    if frozenset(os.listdir(staging_descriptor)) != expected_entries:
+        raise RuntimeError("staged ONNX export entries changed before publication")
     _require_file_identity(staging_descriptor, _MODEL_NAME, model_descriptor)
     _require_file_identity(staging_descriptor, _METADATA_NAME, metadata_descriptor)
     if _read_file_descriptor(metadata_descriptor) != metadata.to_json_bytes():
