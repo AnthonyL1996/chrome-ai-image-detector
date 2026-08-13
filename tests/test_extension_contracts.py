@@ -50,6 +50,9 @@ class ExtensionContracts(unittest.TestCase):
         self.assertEqual(self.manifest["manifest_version"], 3)
         self.assertEqual(set(self.manifest["permissions"]), {"activeTab", "scripting"})
         self.assertNotIn("host_permissions", self.manifest)
+        self.assertEqual(
+            self.manifest["optional_host_permissions"], ["http://*/*", "https://*/*"]
+        )
         self.assertNotIn("content_scripts", self.manifest)
         self.assertNotIn("externally_connectable", self.manifest)
         self.assertEqual(
@@ -100,6 +103,15 @@ class ExtensionContracts(unittest.TestCase):
         self.assertIn("localOnly: true", source)
         self.assertIn('code: "MODEL_RUNTIME_UNAVAILABLE"', source)
         self.assertNotRegex(source, r"(?i)https?://")
+
+    def test_onnx_backend_is_local_and_hash_checked(self) -> None:
+        source = (EXTENSION / "runtime" / "onnx-backend.mjs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('executionProviders: ["wasm"]', source)
+        self.assertIn("model_sha256", source)
+        self.assertIn("localOnly: true", source)
+        self.assertIn('redirect: "error"', source)
 
     def test_extension_javascript_has_no_remote_or_dynamic_code_execution(self) -> None:
         forbidden = re.compile(

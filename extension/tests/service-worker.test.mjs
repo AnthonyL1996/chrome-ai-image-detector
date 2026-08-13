@@ -22,6 +22,10 @@ async function loadServiceWorker(overrides = {}) {
       query: async () => [{ id: 17 }],
       sendMessage: async () => ({ ok: true, count: 0, errors: 0, skipped: 0 }),
     },
+    permissions: {
+      contains: async () => true,
+      request: async () => true,
+    },
     ...overrides,
   };
   const context = vm.createContext({ chrome, console, URL });
@@ -182,4 +186,51 @@ test("a tab is reserved before asynchronous scan setup begins", async () => {
 
   releaseSetup();
   assert.equal((await firstScan).ok, true);
+});
+
+test("scan requests optional access only for the active page origin", async () => {
+  const requested = [];
+  const worker = await loadServiceWorker({
+    permissions: {
+      contains: async () => false,
+      request: async (details) => {
+        requested.push(details);
+        return true;
+      },
+    },
+    tabs: {
+      query: async () => [{ id: 17, url: "https://example.test:8443/article" }],
+      sendMessage: async () => ({ ok: true, count: 0, errors: 0, skipped: 0 }),
+    },
+  });
+
+  const response = await worker.dispatch(
+    { type: "SCAN_ACTIVE_TAB" },
+    { id: "extension-id", url: "chrome-extension://extension-id/popup.html" },
+  );
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(requested, [{ origins: ["https://example.test:8443/*"] }]);
+});
+
+test("scan stops before script injection when optional origin access is denied", async () => {
+  const worker = await loadServiceWorker({
+    permissions: {
+      contains: async () => false,
+      request: async () => false,
+    },
+    tabs: {
+      query: async () => [{ id: 17, url: "https://example.test/article" }],
+      sendMessage: async () => assert.fail("denied scans must not message the page"),
+    },
+  });
+
+  const response = await worker.dispatch(
+    { type: "SCAN_ACTIVE_TAB" },
+    { id: "extension-id", url: "chrome-extension://extension-id/popup.html" },
+  );
+
+  assert.equal(response.ok, false);
+  assert.match(response.error, /access|permission|denied/i);
+  assert.deepEqual(worker.calls, []);
 });
