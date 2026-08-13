@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-import errno
 import hashlib
 import importlib
 import io
@@ -455,11 +454,6 @@ def _cleanup_staging(staging: Path, directory_descriptor: int) -> None:
         if stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
             os.unlink(name, dir_fd=directory_descriptor)
     _require_directory_identity(staging, directory_descriptor)
-    try:
-        os.rmdir(staging)
-    except OSError as error:
-        if error.errno != errno.ENOTEMPTY:
-            raise
 
 
 def _onnx_tensor(value: Any, onnx: Any) -> OnnxTensor:
