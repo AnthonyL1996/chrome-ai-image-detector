@@ -18,7 +18,9 @@ from poidh_detector.contracts import SampleRecord
 from poidh_detector.data import SplitManifest
 from poidh_detector.inference import (
     FIXED_THRESHOLD,
+    _verify_preparation,
     build_inference_result,
+    load_registered_exposed_holdouts,
     load_selected_checkpoint,
     partition_sha256,
     predict_logits,
@@ -217,6 +219,10 @@ class InferenceResultTests(unittest.TestCase):
             partition_sha256(split.assignments, "validation"),
         )
         self.assertEqual(document["metrics"]["threshold"], 0.65)
+        self.assertEqual(
+            document["exposed_holdout_manifest_sha256"],
+            list(config.exposed_holdout_sha256),
+        )
         self.assertRegex(document["environment_sha256"], r"^[0-9a-f]{64}$")
 
     def test_refuses_train_inference_or_incomplete_and_mismatched_partitions(
@@ -301,6 +307,70 @@ class InferenceResultTests(unittest.TestCase):
 
 
 class SelectedCheckpointTests(unittest.TestCase):
+    def test_registered_holdout_loader_requires_exact_checkpoint_digest_set(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "mirage-v1.json"
+            payload = json.dumps(
+                {
+                    "schema_version": 1,
+                    "entries": [
+                        {
+                            "file_name": "holdout.png",
+                            "content_sha256": _digest("holdout"),
+                        }
+                    ],
+                },
+                sort_keys=True,
+            ).encode()
+            path.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+
+            loaded = load_registered_exposed_holdouts(
+                (path,), expected_sha256=(digest,)
+            )
+            self.assertEqual(loaded[0].registration.manifest_sha256, digest)
+            with self.assertRaisesRegex(ValueError, "exactly the registered"):
+                load_registered_exposed_holdouts(
+                    (path,), expected_sha256=(_digest("different-manifest"),)
+                )
+            with self.assertRaisesRegex(ValueError, "exactly the registered"):
+                load_registered_exposed_holdouts((), expected_sha256=(digest,))
+
+    def test_preparation_provenance_binds_dataset_split_and_holdouts(self) -> None:
+        expected = {
+            "manifest_sha256": _digest("dataset"),
+            "splits_sha256": _digest("split"),
+            "exposed_holdout_manifest_sha256": [_digest("holdout")],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "preparation.json"
+            for field_name, error in (
+                ("manifest_sha256", "preparation manifest digest mismatch"),
+                ("splits_sha256", "preparation split digest mismatch"),
+                (
+                    "exposed_holdout_manifest_sha256",
+                    "preparation exposed holdout digests mismatch",
+                ),
+            ):
+                changed = dict(expected)
+                changed[field_name] = (
+                    [_digest("different")]
+                    if field_name == "exposed_holdout_manifest_sha256"
+                    else _digest("different")
+                )
+                path.write_text(json.dumps(changed), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, error):
+                    _verify_preparation(
+                        path,
+                        dataset_manifest_sha256=expected["manifest_sha256"],
+                        split_manifest_sha256=expected["splits_sha256"],
+                        exposed_holdout_sha256=tuple(
+                            expected["exposed_holdout_manifest_sha256"]
+                        ),
+                    )
+
     @unittest.skipUnless(_TORCH_AVAILABLE, "PyTorch integration test")
     def test_loads_only_verified_current_generation_with_exact_environment(
         self,
@@ -411,6 +481,12 @@ class SelectedCheckpointTests(unittest.TestCase):
             patch(
                 "poidh_detector.inference.samples_for_split", return_value=samples
             ) as select_samples,
+            patch("poidh_detector.inference._verify_preparation") as preparation,
+            patch(
+                "poidh_detector.inference.load_registered_exposed_holdouts",
+                return_value=(object(),),
+            ) as load_holdouts,
+            patch("poidh_detector.inference.reject_holdout_overlap") as reject_overlap,
             patch(
                 "poidh_detector.inference.DatasetImageSamples", return_value=dataset
             ) as build_dataset,
@@ -424,6 +500,7 @@ class SelectedCheckpointTests(unittest.TestCase):
                 Path("/dataset"),
                 Path("/run"),
                 partition="validation",
+                holdout_manifests=(Path("/holdout.json"),),
                 batch_size=8,
                 workers=0,
                 device="cpu",
@@ -438,8 +515,19 @@ class SelectedCheckpointTests(unittest.TestCase):
             expected_sha256=config.split_manifest_sha256,
         )
         manifest.verify_materialized_files.assert_called_once_with(Path("/dataset"))
+        preparation.assert_called_once_with(
+            Path("/dataset/preparation.json"),
+            dataset_manifest_sha256=config.dataset_manifest_sha256,
+            split_manifest_sha256=config.split_manifest_sha256,
+            exposed_holdout_sha256=config.exposed_holdout_sha256,
+        )
+        load_holdouts.assert_called_once_with(
+            (Path("/holdout.json"),),
+            expected_sha256=config.exposed_holdout_sha256,
+        )
         deterministic.assert_called_once_with(config.seed, torch_module=ANY)
         select_samples.assert_called_once_with(manifest, split, "validation")
+        reject_overlap.assert_called_once_with(samples, (ANY,))
         build_dataset.assert_called_once_with(samples, Path("/dataset"))
         predict.assert_called_once()
 
@@ -448,6 +536,7 @@ class SelectedCheckpointTests(unittest.TestCase):
                 Path("/dataset"),
                 Path("/run"),
                 partition="train",
+                holdout_manifests=(Path("/holdout.json"),),
                 batch_size=8,
                 workers=0,
                 device="cpu",

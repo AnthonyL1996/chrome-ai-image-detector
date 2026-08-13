@@ -10,6 +10,12 @@ from pathlib import Path
 import re
 from typing import Any, Literal
 
+from poidh_benchmark.leakage import (
+    HoldoutIndex,
+    HoldoutRegistration,
+    load_registered_holdout,
+    reject_holdout_overlap,
+)
 from poidh_detector.calibration_fit import (
     CalibrationPrediction,
     CalibrationPredictions,
@@ -72,6 +78,7 @@ class InferenceResult:
     partition_sha256: str
     training_config_sha256: str
     environment_sha256: str
+    exposed_holdout_manifest_sha256: tuple[str, ...]
     predictions: tuple[CalibrationPrediction, ...]
     metrics: InferenceMetrics
 
@@ -95,6 +102,9 @@ class InferenceResult:
             "checkpoint_sha256": self.checkpoint_sha256,
             "dataset_manifest_sha256": self.dataset_manifest_sha256,
             "environment_sha256": self.environment_sha256,
+            "exposed_holdout_manifest_sha256": list(
+                self.exposed_holdout_manifest_sha256
+            ),
             "metrics": asdict(self.metrics),
             "partition": self.partition,
             "partition_sha256": self.partition_sha256,
@@ -178,9 +188,6 @@ def build_inference_result(
         and selected_partition_sha256 != training_config.calibration_split_sha256
     ):
         raise ValueError("calibration split digest mismatch")
-    if selected_partition_sha256 in training_config.exposed_holdout_sha256:
-        raise ValueError("inference partition overlaps an exposed holdout")
-
     rows = tuple(predictions)
     if any(type(row) is not CalibrationPrediction for row in rows):
         raise TypeError("predictions must contain CalibrationPrediction rows")
@@ -211,6 +218,7 @@ def build_inference_result(
         partition_sha256=selected_partition_sha256,
         training_config_sha256=training_config.sha256,
         environment_sha256=_environment_sha256(environment),
+        exposed_holdout_manifest_sha256=training_config.exposed_holdout_sha256,
         predictions=rows,
         metrics=metrics,
     )
@@ -318,6 +326,7 @@ def run_inference(
     run: Path,
     *,
     partition: str,
+    holdout_manifests: Sequence[Path],
     batch_size: int,
     workers: int,
     device: str,
@@ -338,14 +347,25 @@ def run_inference(
     manifest = load_dataset_manifest(dataset_root / "manifest.json")
     if manifest.sha256 != selected.training_config.dataset_manifest_sha256:
         raise ValueError("dataset manifest digest mismatch")
+    _verify_preparation(
+        dataset_root / "preparation.json",
+        dataset_manifest_sha256=manifest.sha256,
+        split_manifest_sha256=selected.training_config.split_manifest_sha256,
+        exposed_holdout_sha256=selected.training_config.exposed_holdout_sha256,
+    )
+    holdouts = load_registered_exposed_holdouts(
+        holdout_manifests,
+        expected_sha256=selected.training_config.exposed_holdout_sha256,
+    )
     split_manifest = load_split_manifest(
         dataset_root / "splits.json",
         manifest,
         expected_sha256=selected.training_config.split_manifest_sha256,
     )
     manifest.verify_materialized_files(dataset_root)
-    configure_determinism(selected.training_config.seed, torch_module=torch)
     samples = samples_for_split(manifest, split_manifest, partition)
+    reject_holdout_overlap(samples, holdouts)
+    configure_determinism(selected.training_config.seed, torch_module=torch)
     dataset = DatasetImageSamples(samples, dataset_root)
     predictions = predict_logits(
         selected.model,
@@ -363,6 +383,78 @@ def run_inference(
         checkpoint_sha256=selected.checkpoint_sha256,
         environment=selected.environment,
     )
+
+
+def load_registered_exposed_holdouts(
+    paths: Sequence[Path], *, expected_sha256: Sequence[str]
+) -> tuple[HoldoutIndex, ...]:
+    expected = tuple(sorted(expected_sha256))
+    if not expected:
+        raise ValueError("at least one registered exposed holdout is required")
+    for digest in expected:
+        _require_sha256(digest, "expected exposed holdout digest")
+
+    manifest_paths = tuple(paths)
+    if len(manifest_paths) != len(expected):
+        raise ValueError(
+            "exactly the registered exposed holdout manifests are required"
+        )
+    loaded: list[HoldoutIndex] = []
+    observed: list[str] = []
+    for path in manifest_paths:
+        if not isinstance(path, Path):
+            raise TypeError("holdout manifest paths must be pathlib.Path values")
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("registered exposed holdout must be a real manifest file")
+        try:
+            payload = path.read_bytes()
+        except OSError as error:
+            raise ValueError(
+                "registered exposed holdout manifest is unreadable"
+            ) from error
+        digest = hashlib.sha256(payload).hexdigest()
+        observed.append(digest)
+        loaded.append(
+            load_registered_holdout(
+                HoldoutRegistration(
+                    holdout_id=path.stem,
+                    manifest_path=path,
+                    manifest_sha256=digest,
+                    status="development_exposed",
+                )
+            )
+        )
+    if tuple(sorted(observed)) != expected:
+        raise ValueError(
+            "exactly the registered exposed holdout manifests are required"
+        )
+    return tuple(loaded)
+
+
+def _verify_preparation(
+    path: Path,
+    *,
+    dataset_manifest_sha256: str,
+    split_manifest_sha256: str,
+    exposed_holdout_sha256: Sequence[str],
+) -> None:
+    document, _ = _canonical_object(path, "preparation provenance")
+    required = {
+        "manifest_sha256",
+        "splits_sha256",
+        "exposed_holdout_manifest_sha256",
+    }
+    if not required.issubset(document):
+        raise ValueError("preparation provenance is missing required digest bindings")
+    registered = document["exposed_holdout_manifest_sha256"]
+    if not isinstance(registered, list) or not registered:
+        raise ValueError("preparation provenance requires exposed holdout digests")
+    if document["manifest_sha256"] != dataset_manifest_sha256:
+        raise ValueError("preparation manifest digest mismatch")
+    if document["splits_sha256"] != split_manifest_sha256:
+        raise ValueError("preparation split digest mismatch")
+    if tuple(sorted(registered)) != tuple(sorted(exposed_holdout_sha256)):
+        raise ValueError("preparation exposed holdout digests mismatch")
 
 
 def _load_training_config(path: Path) -> TrainingConfig:

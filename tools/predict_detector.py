@@ -20,6 +20,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         parsed.dataset_root,
         parsed.run,
         partition=parsed.partition,
+        holdout_manifests=tuple(parsed.holdout_manifest),
         batch_size=parsed.batch_size,
         workers=parsed.workers,
         device=parsed.device,
@@ -39,6 +40,13 @@ def _parse_arguments(arguments: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("run", type=Path)
     parser.add_argument(
         "--partition", choices=("calibration", "validation"), required=True
+    )
+    parser.add_argument(
+        "--holdout-manifest",
+        action="append",
+        type=Path,
+        required=True,
+        help="Registered exposed holdout manifest; repeat for every configured holdout",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=64)
