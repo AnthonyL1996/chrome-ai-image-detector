@@ -612,6 +612,119 @@ class OnnxExporterTests(unittest.TestCase):
             quarantine = _quarantined_export(destination)
             self.assertFalse((quarantine / "READY").exists())
 
+    def test_foreign_entry_before_atomic_rename_cannot_publish_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            destination = paths["output"].absolute()
+            real_rename = onnx_export._rename_directory_no_replace
+
+            def inject_foreign_entry(
+                parent_descriptor: int,
+                source_name: str,
+                destination_name: str,
+            ) -> None:
+                staging_descriptor = os.open(
+                    source_name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    dir_fd=parent_descriptor,
+                )
+                try:
+                    foreign_descriptor = os.open(
+                        "foreign.bin",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=staging_descriptor,
+                    )
+                    with os.fdopen(foreign_descriptor, "wb") as stream:
+                        stream.write(b"foreign")
+                finally:
+                    os.close(staging_descriptor)
+                real_rename(parent_descriptor, source_name, destination_name)
+
+            with patch.object(
+                onnx_export,
+                "_rename_directory_no_replace",
+                inject_foreign_entry,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "entries"):
+                    export_detector_onnx(
+                        **paths,
+                        torch_module=_FakeTorch(),
+                        timm_module=_FakeTimm(_FakeDetector()),
+                        import_module=lambda name: _FakeOnnx()
+                        if name == "onnx"
+                        else _missing_onnx(name),
+                    )
+
+            self.assertFalse(destination.exists())
+            quarantine = _quarantined_export(destination)
+            self.assertFalse((quarantine / "READY").exists())
+
+    def test_accepted_replacement_files_are_fsynced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            real_open_regular_file_at = onnx_export._open_regular_file_at
+            real_fsync = os.fsync
+            accepted_identities: dict[str, tuple[int, int]] = {}
+            synced_identities: set[tuple[int, int]] = set()
+
+            def substitute_before_open(directory_descriptor: int, name: str) -> int:
+                original_descriptor = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_descriptor,
+                )
+                try:
+                    original = os.fstat(original_descriptor)
+                    payload = onnx_export._read_file_descriptor(original_descriptor)
+                    os.unlink(name, dir_fd=directory_descriptor)
+                    replacement_descriptor = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=directory_descriptor,
+                    )
+                    with os.fdopen(replacement_descriptor, "wb") as stream:
+                        stream.write(payload)
+                    accepted_descriptor = real_open_regular_file_at(
+                        directory_descriptor, name
+                    )
+                    accepted = os.fstat(accepted_descriptor)
+                    original_identity = (original.st_dev, original.st_ino)
+                    accepted_identity = (accepted.st_dev, accepted.st_ino)
+                    self.assertNotEqual(original_identity, accepted_identity)
+                    accepted_identities[name] = accepted_identity
+                    return accepted_descriptor
+                finally:
+                    os.close(original_descriptor)
+
+            def record_fsync(descriptor: int) -> None:
+                opened = os.fstat(descriptor)
+                synced_identities.add((opened.st_dev, opened.st_ino))
+                real_fsync(descriptor)
+
+            with (
+                patch.object(
+                    onnx_export,
+                    "_open_regular_file_at",
+                    substitute_before_open,
+                ),
+                patch.object(os, "fsync", record_fsync),
+            ):
+                export_detector_onnx(
+                    **paths,
+                    torch_module=_FakeTorch(),
+                    timm_module=_FakeTimm(_FakeDetector()),
+                    import_module=lambda name: _FakeOnnx()
+                    if name == "onnx"
+                    else _missing_onnx(name),
+                )
+
+            self.assertEqual(
+                set(accepted_identities), {"detector.onnx", "metadata.json"}
+            )
+            self.assertLessEqual(set(accepted_identities.values()), synced_identities)
+
     def test_cleanup_never_deletes_replaced_destination(self) -> None:
         for replacement_stage in ("before-rename", "after-rename"):
             with self.subTest(replacement_stage=replacement_stage):
