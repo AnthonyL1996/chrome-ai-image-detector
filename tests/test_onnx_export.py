@@ -505,6 +505,75 @@ class OnnxExporterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "model digest mismatch"):
                 onnx_export.validate_export_bundle(paths["output"])
 
+    def test_publication_has_no_redundant_post_publish_parent_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            destination = paths["output"].absolute()
+            real_fsync = os.fsync
+            visible_parent_syncs = 0
+
+            def fail_second_visible_parent_sync(descriptor: int) -> None:
+                nonlocal visible_parent_syncs
+                if destination.exists():
+                    parent_stat = os.stat(destination.parent)
+                    descriptor_stat = os.fstat(descriptor)
+                    if (parent_stat.st_dev, parent_stat.st_ino) == (
+                        descriptor_stat.st_dev,
+                        descriptor_stat.st_ino,
+                    ):
+                        visible_parent_syncs += 1
+                        if visible_parent_syncs == 2:
+                            raise OSError("durability fault")
+                real_fsync(descriptor)
+
+            with patch.object(os, "fsync", fail_second_visible_parent_sync):
+                export_detector_onnx(
+                    **paths,
+                    torch_module=_FakeTorch(),
+                    timm_module=_FakeTimm(_FakeDetector()),
+                    import_module=lambda name: _FakeOnnx()
+                    if name == "onnx"
+                    else _missing_onnx(name),
+                )
+
+            self.assertEqual(visible_parent_syncs, 1)
+            self.assertTrue((destination / "READY").is_file())
+
+    def test_model_mutation_during_ready_creation_cannot_publish_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            destination = paths["output"].absolute()
+            real_write_file_at = onnx_export._write_file_at
+
+            def mutate_before_ready(
+                directory_descriptor: int, name: str, payload: bytes
+            ) -> None:
+                if name.startswith(".READY."):
+                    model_descriptor = os.open(
+                        "detector.onnx", os.O_WRONLY, dir_fd=directory_descriptor
+                    )
+                    try:
+                        os.ftruncate(model_descriptor, 0)
+                        os.write(model_descriptor, b"mutated-model")
+                    finally:
+                        os.close(model_descriptor)
+                real_write_file_at(directory_descriptor, name, payload)
+
+            with patch.object(onnx_export, "_write_file_at", mutate_before_ready):
+                with self.assertRaisesRegex(RuntimeError, "model changed"):
+                    export_detector_onnx(
+                        **paths,
+                        torch_module=_FakeTorch(),
+                        timm_module=_FakeTimm(_FakeDetector()),
+                        import_module=lambda name: _FakeOnnx()
+                        if name == "onnx"
+                        else _missing_onnx(name),
+                    )
+
+            self.assertFalse(destination.exists())
+            quarantine = _quarantined_export(destination)
+            self.assertFalse((quarantine / "READY").exists())
+
     def test_cleanup_never_deletes_replaced_destination(self) -> None:
         for replacement_stage in ("before-rename", "after-rename"):
             with self.subTest(replacement_stage=replacement_stage):
