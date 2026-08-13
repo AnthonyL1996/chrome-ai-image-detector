@@ -333,6 +333,7 @@ def _load_export_metadata(payload: bytes) -> ExportMetadata:
 
 def _publish_bundle(staging: Path, destination: Path, metadata: ExportMetadata) -> None:
     owns_destination = False
+    reservation_token: str | None = None
     ready_temporary: Path | None = None
     try:
         try:
@@ -373,12 +374,16 @@ def _publish_bundle(staging: Path, destination: Path, metadata: ExportMetadata) 
     finally:
         if ready_temporary is not None and os.path.lexists(ready_temporary):
             ready_temporary.unlink()
-        if owns_destination and not os.path.lexists(destination / _READY_NAME):
+        if (
+            owns_destination
+            and reservation_token is not None
+            and not os.path.lexists(destination / _READY_NAME)
+        ):
             reservation = destination / ".reservation"
             try:
                 owned = reservation.read_text(encoding="ascii") == reservation_token
-            except (NameError, OSError):
-                owned = not any(destination.iterdir())
+            except OSError:
+                owned = False
             if owned:
                 shutil.rmtree(destination)
                 _fsync_directory(destination.parent)
