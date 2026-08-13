@@ -322,7 +322,7 @@ def _capture_provenance(repository: Path) -> PreparationProvenance:
     import subprocess
 
     status = subprocess.run(
-        ["git", "status", "--porcelain"],
+        ["git", "status", "--porcelain", "--untracked-files=all"],
         cwd=repository,
         check=True,
         capture_output=True,

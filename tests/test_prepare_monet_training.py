@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -11,6 +12,7 @@ from unittest.mock import patch
 
 from tools.prepare_monet_training import (
     SOURCE_PATHS,
+    _capture_provenance,
     _load_candidates,
     _load_exposed_holdouts,
     _parse_rows,
@@ -32,6 +34,58 @@ def _raw_row(index: int, source: str = "synthetic-flux-schnell") -> dict[str, ob
 
 
 class PrepareMonetTrainingTests(unittest.TestCase):
+    def test_provenance_refuses_untracked_files_hidden_by_repository_config(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "--quiet",
+                    "-m",
+                    "initial",
+                ],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "status.showUntrackedFiles", "no"],
+                cwd=repository,
+                check=True,
+            )
+            (repository / "hidden-untracked.txt").write_text(
+                "must invalidate provenance\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "dirty worktree"):
+                _capture_provenance(repository)
+
+    def test_provenance_uses_exact_untracked_override_command(self) -> None:
+        repository = Path("/frozen/repository")
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="?? hidden-untracked.txt\n"
+        )
+
+        with patch("subprocess.run", return_value=completed) as run:
+            with self.assertRaisesRegex(RuntimeError, "dirty worktree"):
+                _capture_provenance(repository)
+
+        run.assert_called_once_with(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
     def test_parse_rows_matches_pinned_binary_thumbnail_schema(self) -> None:
         parsed = _parse_rows(
             [_raw_row(1)],
