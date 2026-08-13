@@ -7,3 +7,4 @@ artifacts/
 artifact-*.json
 data/
 models/
+message
