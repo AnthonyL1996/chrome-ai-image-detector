@@ -650,6 +650,87 @@ class OnnxExporterTests(unittest.TestCase):
             self.assertEqual(foreign_file.read_text(encoding="ascii"), "foreign")
             self.assertTrue((displaced / "READY").is_file())
 
+    def test_publication_fails_if_destination_is_replaced_during_staging_cleanup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            destination = paths["output"].absolute()
+            displaced = destination.with_name("displaced-export")
+            foreign_file = destination / "foreign.txt"
+            real_fsync_directory = onnx_export._fsync_directory
+            parent_syncs = 0
+
+            def replace_during_staging_cleanup(path: Path, **kwargs: object) -> None:
+                nonlocal parent_syncs
+                real_fsync_directory(path, **kwargs)
+                if path == destination.parent:
+                    parent_syncs += 1
+                    if parent_syncs == 3:
+                        destination.rename(displaced)
+                        destination.mkdir()
+                        foreign_file.write_text("foreign", encoding="ascii")
+
+            with patch.object(
+                onnx_export,
+                "_fsync_directory",
+                replace_during_staging_cleanup,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity"):
+                    export_detector_onnx(
+                        **paths,
+                        torch_module=_FakeTorch(),
+                        timm_module=_FakeTimm(_FakeDetector()),
+                        import_module=lambda name: _FakeOnnx()
+                        if name == "onnx"
+                        else _missing_onnx(name),
+                    )
+
+            self.assertEqual(foreign_file.read_text(encoding="ascii"), "foreign")
+            self.assertTrue((displaced / "READY").is_file())
+
+    def test_staging_cleanup_does_not_delete_a_replacement_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            staging_path: Path | None = None
+            displaced_staging: Path | None = None
+            foreign_file: Path | None = None
+            real_publish_bundle = onnx_export._publish_bundle
+
+            def replace_staging_after_publication(
+                staging: Path,
+                destination: Path,
+                metadata: ExportMetadata,
+            ) -> None:
+                nonlocal staging_path, displaced_staging, foreign_file
+                real_publish_bundle(staging, destination, metadata)
+                staging_path = staging
+                displaced_staging = staging.with_name(f"{staging.name}.displaced")
+                staging.rename(displaced_staging)
+                staging.mkdir()
+                foreign_file = staging / "foreign.txt"
+                foreign_file.write_text("foreign", encoding="ascii")
+
+            with patch.object(
+                onnx_export,
+                "_publish_bundle",
+                replace_staging_after_publication,
+            ):
+                export_detector_onnx(
+                    **paths,
+                    torch_module=_FakeTorch(),
+                    timm_module=_FakeTimm(_FakeDetector()),
+                    import_module=lambda name: _FakeOnnx()
+                    if name == "onnx"
+                    else _missing_onnx(name),
+                )
+
+            assert staging_path is not None
+            assert displaced_staging is not None
+            assert foreign_file is not None
+            self.assertEqual(foreign_file.read_text(encoding="ascii"), "foreign")
+            self.assertTrue(displaced_staging.is_dir())
+
     def test_windows_directory_fsync_is_a_supported_noop(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(os, "fsync") as fsync:
