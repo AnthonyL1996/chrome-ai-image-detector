@@ -83,11 +83,19 @@
     return factory;
   }
 
-  function restoreDescription({ image, previous }) {
-    if (previous === null) {
+  function removeOwnedDescription({ image, ownedId }) {
+    const current = image.getAttribute("aria-describedby");
+    if (current === null) {
+      return;
+    }
+    const remaining = current
+      .trim()
+      .split(/\s+/)
+      .filter((token) => token && token !== ownedId);
+    if (remaining.length === 0) {
       image.removeAttribute("aria-describedby");
     } else {
-      image.setAttribute("aria-describedby", previous);
+      image.setAttribute("aria-describedby", remaining.join(" "));
     }
   }
 
@@ -97,7 +105,7 @@
       return;
     }
     for (const relationship of state.relationships) {
-      restoreDescription(relationship);
+      removeOwnedDescription(relationship);
     }
     for (const node of state.nodes) {
       node.remove();
@@ -131,10 +139,10 @@
     `;
     shadow.append(style, factory.createElement("slot"));
 
-    const previous = image.getAttribute("aria-describedby");
-    const descriptions = previous ? previous.trim().split(/\s+/) : [];
+    const current = image.getAttribute("aria-describedby");
+    const descriptions = current ? current.trim().split(/\s+/).filter(Boolean) : [];
     image.setAttribute("aria-describedby", [...descriptions, id].join(" "));
-    state.relationships.push({ image, previous });
+    state.relationships.push({ image, ownedId: id });
     state.nodes.push(annotation);
     image.after(annotation);
     return annotation;
