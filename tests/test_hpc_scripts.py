@@ -57,6 +57,7 @@ def _run_training_script(
     run_name: str,
     resume: bool,
     dependency_mode: str = "valid",
+    worker_count: str | None = None,
     script_path: Path = TRAIN_PATH,
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
     root = Path(temporary)
@@ -107,8 +108,11 @@ def _run_training_script(
         "TRAIN_PROFILE",
         "TRAIN_RESUME",
         "VSC_SCRATCH",
+        "POIDH_WORKERS",
     ):
         environment.pop(variable, None)
+    if worker_count is not None:
+        environment["POIDH_WORKERS"] = worker_count
     if script_path == SMOKE_PATH:
         command = [
             "bash",
@@ -207,6 +211,32 @@ class HpcScriptContracts(unittest.TestCase):
         self.assertIn('"${RUN_DIRECTORY}" \\\n', script)
         self.assertIn('--profile "${TRAIN_PROFILE}"', script)
         self.assertIn("--seed 323", script)
+        self.assertIn('TRAIN_WORKERS="${POIDH_WORKERS:-${SLURM_CPUS_PER_TASK:-8}}"', script)
+        self.assertIn('--workers "${TRAIN_WORKERS}"', script)
+
+    def test_training_worker_count_can_be_pinned_independently_of_slurm_rounding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            completed, invocation_log, _, _ = _run_training_script(
+                temporary,
+                run_name="pinned-workers",
+                resume=False,
+                worker_count="4",
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            arguments = invocation_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(arguments[arguments.index("--workers") + 1], "4")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            completed, invocation_log, _, _ = _run_training_script(
+                temporary,
+                run_name="invalid-workers",
+                resume=False,
+                worker_count="0",
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(invocation_log.exists())
 
     def test_fresh_training_accepts_only_an_absent_run_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -304,10 +334,11 @@ class HpcScriptContracts(unittest.TestCase):
             "hpc/wice_h100_smoke.slurm",
             '--time="${TRAIN_WALLTIME}"',
             'TRAIN_PROFILE="pilot"',
+            "POIDH_WORKERS=4",
             "squeue --me",
             "sacct -j",
             "tail -f",
-            "--export=NONE",
+            "--export=POIDH_WORKERS=",
             "--no-deps --target",
             "timm==1.0.28",
             "PyTorch-bundle/2.9.1-foss-2025a-CUDA-12.8.0-whl",
@@ -316,6 +347,7 @@ class HpcScriptContracts(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn(command, readme)
         self.assertNotIn("--export=ALL", readme)
+        self.assertIn('--export=POIDH_WORKERS="${POIDH_WORKERS}"', readme)
         self.assertIn('"${POIDH_PYTHON_DEPS}"', readme)
 
     def test_compute_jobs_never_install_or_download_packages(self) -> None:

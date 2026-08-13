@@ -34,6 +34,7 @@ POIDH_RUN_ROOT=${POIDH_RUN_ROOT:?"POIDH_RUN_ROOT must be set"}
 POIDH_PYTHON_DEPS=${POIDH_PYTHON_DEPS:?"POIDH_PYTHON_DEPS must be set"}
 TRAIN_PROFILE="${TRAIN_PROFILE:-pilot}"
 TRAIN_RESUME="${TRAIN_RESUME:-0}"
+TRAIN_WORKERS="${POIDH_WORKERS:-${SLURM_CPUS_PER_TASK:-8}}"
 
 canonical_directory() {
     local requested=$1
@@ -78,6 +79,10 @@ case "${TRAIN_RESUME}" in
     0|1) ;;
     *) echo "TRAIN_RESUME must be 0 or 1" >&2; exit 2 ;;
 esac
+if ! [[ "${TRAIN_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "POIDH_WORKERS must be a positive integer" >&2
+    exit 2
+fi
 
 SUBMIT_DIRECTORY=${SLURM_SUBMIT_DIR:?"SLURM_SUBMIT_DIR must be set"}
 if [[ ! -f "${SUBMIT_DIRECTORY}/tools/train_detector.py" ]]; then
@@ -126,5 +131,5 @@ python tools/train_detector.py \
     "${RUN_DIRECTORY}" \
     --profile "${TRAIN_PROFILE}" \
     --seed 323 \
-    --workers "${SLURM_CPUS_PER_TASK:-8}" \
+    --workers "${TRAIN_WORKERS}" \
     "${RESUME_ARGUMENTS[@]}"

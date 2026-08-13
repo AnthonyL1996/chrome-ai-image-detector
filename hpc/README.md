@@ -97,11 +97,11 @@ The smoke job is hard-capped at `00:10:00` and loads
 version-checks torch 2.9.1 (accepting its `+cu128` suffix), torchvision 0.24.1,
 and timm 1.0.28. It prints the observed versions and does not train or modify
 the dataset.
-`--export=NONE` prevents unrelated login-shell variables, including accidental
-credentials, from entering the job. Scratch paths are non-secret positional
-arguments; Slurm still supplies its `SLURM_*` variables, and the scripts use a
-login Bash shell to initialize the module command before loading the pinned
-environment.
+`--export=POIDH_WORKERS=...` exports only the explicit worker override, keeping
+unrelated login-shell variables (including accidental credentials) out of the
+job. Scratch paths are non-secret positional arguments; Slurm still supplies
+its `SLURM_*` variables, and the scripts use a login Bash shell to initialize
+the module command before loading the pinned environment.
 
 ## Submit staged training
 
@@ -114,13 +114,17 @@ walltime override. `TRAIN_PROFILE` accepts `overfit`, `smoke`, `pilot`, or
 ```bash
 TRAIN_PROFILE="pilot"
 TRAIN_WALLTIME="02:00:00"
-TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=NONE hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${POIDH_PYTHON_DEPS}" "${TRAIN_PROFILE}" 0)"
+POIDH_WORKERS=4
+TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --cpus-per-task="${POIDH_WORKERS}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=POIDH_WORKERS="${POIDH_WORKERS}" hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${POIDH_PYTHON_DEPS}" "${TRAIN_PROFILE}" 0)"
 printf 'training job: %s\n' "${TRAIN_JOB_ID}"
 ```
 
 The positional profile value initializes the script's `TRAIN_PROFILE` setting
 without exporting the rest of the submission environment. Direct execution
 also accepts `TRAIN_PROFILE` from the environment.
+Set `POIDH_WORKERS` explicitly for reproducibility: wICE may round a CPU request
+to whole physical cores, while the worker count is part of the optimization
+configuration hash. The pilot contract uses four workers.
 Each fresh job writes to
 `${POIDH_RUN_ROOT}/${TRAIN_PROFILE}-${SLURM_JOB_ID}`. To resume a
 transactionally published run after a walltime stop, reuse its one-component
@@ -130,7 +134,8 @@ name and pass the explicit resume flag:
 TRAIN_PROFILE="pilot"
 TRAIN_WALLTIME="02:00:00"
 POIDH_RUN_NAME="pilot-12345678"
-TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=NONE hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${POIDH_PYTHON_DEPS}" "${TRAIN_PROFILE}" 1 "${POIDH_RUN_NAME}")"
+POIDH_WORKERS=4
+TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --cpus-per-task="${POIDH_WORKERS}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=POIDH_WORKERS="${POIDH_WORKERS}" hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${POIDH_PYTHON_DEPS}" "${TRAIN_PROFILE}" 1 "${POIDH_RUN_NAME}")"
 ```
 
 The script rejects a pre-existing fresh-run path. Resume requires an existing,
