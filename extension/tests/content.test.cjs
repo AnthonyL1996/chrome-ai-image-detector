@@ -219,3 +219,38 @@ test("scanPage removes only nodes it owns and restores image descriptions", asyn
   assert.equal(page.oldAnnotation.removed, false);
   assert.match(image.getAttribute("aria-describedby"), /^page-description poidh/);
 });
+
+test("cleanup preserves page-owned descriptions added during a scan", async () => {
+  const image = { currentSrc: "https://example.test/a.png", src: "", alt: "A" };
+  const page = fakePage([image]);
+  image.setAttribute("aria-describedby", "page-description");
+
+  await scanPage({
+    root: page.root,
+    sendMessage: async () => {
+      image.setAttribute(
+        "aria-describedby",
+        `${image.getAttribute("aria-describedby")} page-dynamic`,
+      );
+      return {
+        ok: true,
+        results: [{ id: "image-1", status: "ok", confidence: 0.5 }],
+      };
+    },
+  });
+  const firstOwnedId = page.annotations[0].id;
+
+  await scanPage({
+    root: page.root,
+    sendMessage: async () => ({
+      ok: true,
+      results: [{ id: "image-1", status: "ok", confidence: 0.6 }],
+    }),
+  });
+
+  const tokens = image.getAttribute("aria-describedby").split(/\s+/);
+  assert.equal(tokens.includes(firstOwnedId), false);
+  assert.equal(tokens.includes("page-description"), true);
+  assert.equal(tokens.includes("page-dynamic"), true);
+  assert.equal(tokens.filter((token) => token.startsWith("poidh-ai-result-")).length, 1);
+});
