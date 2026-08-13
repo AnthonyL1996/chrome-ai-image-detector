@@ -1,0 +1,224 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+import unittest
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+HPC_ROOT = REPOSITORY_ROOT / "hpc"
+SMOKE_PATH = HPC_ROOT / "wice_h100_smoke.slurm"
+TRAIN_PATH = HPC_ROOT / "wice_h100_train.slurm"
+README_PATH = HPC_ROOT / "README.md"
+
+REQUIRED_SBATCH = {
+    "account": "lp_edu_maibi_anndl",
+    "clusters": "wice",
+    "partition": "gpu_h100",
+    "gpus-per-node": "1",
+}
+REQUIRED_MODULE_COMMANDS = (
+    "module --force purge",
+    "module load cluster/wice/gpu_h100",
+    "module load PyTorch/2.9.1-foss-2025a-CUDA-12.8.0-whl",
+)
+
+
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _sbatch_directives(script: str) -> dict[str, str]:
+    directives: dict[str, str] = {}
+    for line in script.splitlines():
+        match = re.fullmatch(r"#SBATCH --([a-z-]+)=(\S+)", line)
+        if match:
+            directives[match.group(1)] = match.group(2)
+    return directives
+
+
+def _duration_seconds(duration: str) -> int:
+    hours, minutes, seconds = (int(part) for part in duration.split(":"))
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _write_executable(path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _run_training_script(
+    temporary: str,
+    *,
+    run_name: str,
+    resume: bool,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    root = Path(temporary)
+    scratch = root / "scratch"
+    data_root = scratch / "data"
+    run_root = scratch / "runs"
+    fake_bin = root / "bin"
+    invocation_log = root / "python-arguments.txt"
+    for directory in (data_root, run_root, fake_bin):
+        directory.mkdir(parents=True, exist_ok=True)
+    _write_executable(fake_bin / "module", "#!/bin/sh\nexit 0\n")
+    _write_executable(fake_bin / "nvidia-smi", "#!/bin/sh\nexit 0\n")
+    _write_executable(
+        fake_bin / "python",
+        '#!/bin/sh\nprintf "%s\\n" "$@" > "$INVOCATION_LOG"\n',
+    )
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "INVOCATION_LOG": str(invocation_log),
+        "POIDH_DATA_ROOT": str(data_root),
+        "POIDH_RUN_NAME": run_name,
+        "POIDH_RUN_ROOT": str(run_root),
+        "SLURM_CPUS_PER_TASK": "3",
+        "SLURM_JOB_ID": "12345",
+        "SLURM_SUBMIT_DIR": str(REPOSITORY_ROOT),
+        "TRAIN_PROFILE": "pilot",
+        "TRAIN_RESUME": "1" if resume else "0",
+        "VSC_SCRATCH": str(scratch),
+    }
+    completed = subprocess.run(
+        ["bash", str(TRAIN_PATH)],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed, invocation_log, run_root
+
+
+class HpcScriptContracts(unittest.TestCase):
+    def test_both_jobs_request_the_pinned_wice_h100_allocation(self) -> None:
+        for path in (SMOKE_PATH, TRAIN_PATH):
+            with self.subTest(path=path.name):
+                directives = _sbatch_directives(_read(path))
+                for option, expected in REQUIRED_SBATCH.items():
+                    self.assertEqual(directives.get(option), expected)
+                self.assertNotIn("gres", directives)
+
+    def test_smoke_job_is_capped_at_ten_minutes(self) -> None:
+        duration = _sbatch_directives(_read(SMOKE_PATH))["time"]
+        self.assertLessEqual(_duration_seconds(duration), 10 * 60)
+
+    def test_jobs_load_only_the_pinned_cluster_environment(self) -> None:
+        for path in (SMOKE_PATH, TRAIN_PATH):
+            with self.subTest(path=path.name):
+                script = _read(path)
+                positions = [
+                    script.index(command) for command in REQUIRED_MODULE_COMMANDS
+                ]
+                self.assertEqual(positions, sorted(positions))
+                self.assertNotIn("pip install", script)
+                self.assertNotRegex(script, r"\b(?:curl|wget|git clone)\b")
+
+    def test_jobs_pin_deterministic_environment_and_require_scratch_paths(self) -> None:
+        for path in (SMOKE_PATH, TRAIN_PATH):
+            with self.subTest(path=path.name):
+                script = _read(path)
+                self.assertIn("export PYTHONHASHSEED=323", script)
+                self.assertIn("export CUBLAS_WORKSPACE_CONFIG=:4096:8", script)
+                self.assertIn('${VSC_SCRATCH:?"VSC_SCRATCH must be set"}', script)
+                self.assertIn(
+                    '${POIDH_DATA_ROOT:?"POIDH_DATA_ROOT must be set"}', script
+                )
+                self.assertIn('${POIDH_RUN_ROOT:?"POIDH_RUN_ROOT must be set"}', script)
+                self.assertIn('case "${DATA_ROOT}" in', script)
+                self.assertIn('case "${RUN_ROOT}" in', script)
+
+    def test_smoke_job_checks_gpu_and_python_imports(self) -> None:
+        script = _read(SMOKE_PATH)
+        self.assertIn("nvidia-smi", script)
+        self.assertIn("import torch", script)
+        self.assertIn("import timm", script)
+        self.assertIn("torch.cuda.is_available()", script)
+
+    def test_training_job_uses_environment_profile_and_training_entrypoint(
+        self,
+    ) -> None:
+        script = _read(TRAIN_PATH)
+        self.assertIn('TRAIN_PROFILE="${TRAIN_PROFILE:-pilot}"', script)
+        self.assertIn("python tools/train_detector.py \\\n", script)
+        self.assertIn('"${DATA_ROOT}" \\\n', script)
+        self.assertIn('"${RUN_DIRECTORY}" \\\n', script)
+        self.assertIn('--profile "${TRAIN_PROFILE}"', script)
+        self.assertIn("--seed 323", script)
+
+    def test_fresh_training_accepts_only_an_absent_run_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            completed, invocation_log, run_root = _run_training_script(
+                temporary, run_name="fresh", resume=False
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            arguments = invocation_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(arguments[0], "tools/train_detector.py")
+            self.assertEqual(arguments[2], str(run_root.resolve() / "fresh"))
+            self.assertNotIn("--resume", arguments)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            existing = Path(temporary) / "scratch" / "runs" / "existing"
+            existing.mkdir(parents=True)
+            completed, invocation_log, _ = _run_training_script(
+                temporary, run_name="existing", resume=False
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(invocation_log.exists())
+
+    def test_resume_requires_a_real_contained_run_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            existing = Path(temporary) / "scratch" / "runs" / "existing"
+            existing.mkdir(parents=True)
+            completed, invocation_log, run_root = _run_training_script(
+                temporary, run_name="existing", resume=True
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            arguments = invocation_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(arguments[2], str(run_root.resolve() / "existing"))
+            self.assertIn("--resume", arguments)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            outside = Path(temporary) / "outside"
+            link = Path(temporary) / "scratch" / "runs" / "escaped"
+            outside.mkdir()
+            link.parent.mkdir(parents=True)
+            link.symlink_to(outside, target_is_directory=True)
+            completed, invocation_log, _ = _run_training_script(
+                temporary, run_name="escaped", resume=True
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(invocation_log.exists())
+
+    def test_readme_gives_exact_transfer_submit_and_monitor_commands(self) -> None:
+        readme = _read(README_PATH)
+        required_commands = (
+            "rsync -az",
+            "hpc/wice_h100_smoke.slurm",
+            '--time="${TRAIN_WALLTIME}"',
+            'TRAIN_PROFILE="pilot"',
+            "squeue --me",
+            "sacct -j",
+            "tail -f",
+            "--export=NONE",
+        )
+        for command in required_commands:
+            with self.subTest(command=command):
+                self.assertIn(command, readme)
+        self.assertNotIn("--export=ALL", readme)
+
+    def test_readme_states_cost_and_bart_first_policy(self) -> None:
+        readme = _read(README_PATH)
+        self.assertRegex(readme, r"597 credits(?:/| per )hour")
+        self.assertIn("Bart", readme)
+        self.assertRegex(readme, r"(?i)Bart.*smoke")
+        self.assertRegex(readme, r"(?i)H100.*pilot")
+
+
+if __name__ == "__main__":
+    unittest.main()
