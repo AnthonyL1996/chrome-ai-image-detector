@@ -33,6 +33,7 @@ SUPPORTED_ONNX_OPERATORS = frozenset(
         "Pad",
         "Pow",
         "ReduceMean",
+        "ReduceL2",
         "Reshape",
         "Resize",
         "Shape",
@@ -97,6 +98,7 @@ class ExportMetadata:
     code_sha256: str
     dataset_manifest_sha256: str
     license_policy_sha256: str
+    model_sha256: str
     preprocessing: PreprocessingContract = field(default_factory=PreprocessingContract)
     schema_version: int = 1
     model_format: str = "onnx"
@@ -128,6 +130,7 @@ class ExportMetadata:
             "code_sha256",
             "dataset_manifest_sha256",
             "license_policy_sha256",
+            "model_sha256",
         ):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not _SHA256.fullmatch(value):
@@ -175,6 +178,7 @@ class ExportMetadata:
             "license_policy_sha256": self.license_policy_sha256,
             "max_model_bytes": self.max_model_bytes,
             "model_format": self.model_format,
+            "model_sha256": self.model_sha256,
             "opset_version": self.opset_version,
             "output_dtype": self.output_dtype,
             "output_name": self.output_name,
