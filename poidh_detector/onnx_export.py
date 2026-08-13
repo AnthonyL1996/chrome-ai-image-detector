@@ -374,8 +374,8 @@ def _publish_bundle(staging: Path, destination: Path, metadata: ExportMetadata) 
         )
         ready_temporary = None
         os.fsync(directory_descriptor)
-        _require_directory_identity(destination, directory_descriptor)
         _fsync_directory(destination.parent)
+        _require_directory_identity(destination, directory_descriptor)
     finally:
         if ready_temporary is not None:
             try:
