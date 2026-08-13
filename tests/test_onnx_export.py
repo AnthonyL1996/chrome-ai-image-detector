@@ -734,6 +734,48 @@ class OnnxExporterTests(unittest.TestCase):
             self.assertEqual(foreign_file.read_text(encoding="ascii"), "foreign")
             self.assertTrue(displaced_staging.is_dir())
 
+    def test_staging_cleanup_does_not_remove_an_empty_replacement_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._inputs(Path(temporary))
+            staging_path: Path | None = None
+            displaced_staging: Path | None = None
+            staging_identity_checks = 0
+            real_require_identity = onnx_export._require_directory_identity
+
+            def replace_after_final_staging_identity(
+                path: Path, descriptor: int
+            ) -> None:
+                nonlocal staging_path, displaced_staging, staging_identity_checks
+                real_require_identity(path, descriptor)
+                if path.name.startswith(".export."):
+                    staging_identity_checks += 1
+                    if staging_identity_checks == 3:
+                        staging_path = path
+                        displaced_staging = path.with_name(f"{path.name}.displaced")
+                        path.rename(displaced_staging)
+                        path.mkdir()
+
+            with patch.object(
+                onnx_export,
+                "_require_directory_identity",
+                replace_after_final_staging_identity,
+            ):
+                export_detector_onnx(
+                    **paths,
+                    torch_module=_FakeTorch(),
+                    timm_module=_FakeTimm(_FakeDetector()),
+                    import_module=lambda name: _FakeOnnx()
+                    if name == "onnx"
+                    else _missing_onnx(name),
+                )
+
+            assert staging_path is not None
+            assert displaced_staging is not None
+            self.assertTrue(staging_path.is_dir())
+            self.assertTrue(displaced_staging.is_dir())
+
     def test_windows_directory_fsync_is_a_supported_noop(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(os, "fsync") as fsync:
