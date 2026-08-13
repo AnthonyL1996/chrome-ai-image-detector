@@ -495,6 +495,55 @@ class OnnxExporterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "model digest mismatch"):
                 onnx_export.validate_export_bundle(paths["output"])
 
+    def test_cleanup_never_deletes_replaced_destination(self) -> None:
+        for replacement_stage in ("before-token", "after-token"):
+            with self.subTest(replacement_stage=replacement_stage):
+                with tempfile.TemporaryDirectory() as temporary:
+                    paths = self._inputs(Path(temporary))
+                    destination = paths["output"].absolute()
+                    displaced = destination.with_name("displaced-export")
+
+                    def replace_destination() -> None:
+                        destination.rename(displaced)
+                        destination.mkdir()
+
+                    real_fsync_file = onnx_export._fsync_file
+
+                    def fail_after_token(path: Path) -> None:
+                        if path.name == ".reservation":
+                            replace_destination()
+                            raise RuntimeError("fault after token")
+                        real_fsync_file(path)
+
+                    if replacement_stage == "before-token":
+
+                        def fail_before_token(_: int) -> str:
+                            replace_destination()
+                            raise RuntimeError("fault before token")
+
+                        failure = patch.object(
+                            onnx_export.secrets, "token_hex", fail_before_token
+                        )
+                    else:
+                        failure = patch.object(
+                            onnx_export, "_fsync_file", fail_after_token
+                        )
+
+                    with failure:
+                        with self.assertRaisesRegex(RuntimeError, "fault"):
+                            export_detector_onnx(
+                                **paths,
+                                torch_module=_FakeTorch(),
+                                timm_module=_FakeTimm(_FakeDetector()),
+                                import_module=lambda name: _FakeOnnx()
+                                if name == "onnx"
+                                else _missing_onnx(name),
+                            )
+
+                    self.assertTrue(destination.is_dir())
+                    self.assertEqual(list(destination.iterdir()), [])
+                    self.assertTrue(displaced.is_dir())
+
     def test_windows_directory_fsync_is_a_supported_noop(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(os, "fsync") as fsync:
