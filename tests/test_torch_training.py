@@ -145,6 +145,35 @@ class ResumeTests(unittest.TestCase):
 
 
 class TransactionalRunTests(unittest.TestCase):
+    def test_file_fsync_uses_writable_descriptor_without_changing_bytes(self) -> None:
+        events: list[tuple[object, ...]] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "artifact.bin"
+            path.write_bytes(b"immutable-checkpoint")
+
+            def open_file(opened_path: Path, mode: str):
+                events.append(("open", opened_path, mode))
+                return opened_path.open(mode)
+
+            torch_training._fsync_file(
+                path,
+                open_file=open_file,
+                fsync_descriptor=lambda descriptor: events.append(
+                    ("fsync", descriptor)
+                ),
+            )
+
+            self.assertEqual(path.read_bytes(), b"immutable-checkpoint")
+            self.assertEqual(events[0], ("open", path, "r+b"))
+            self.assertEqual(events[1][0], "fsync")
+
+    def test_file_fsync_refuses_missing_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "missing.bin"
+
+            with self.assertRaises(FileNotFoundError):
+                torch_training._fsync_file(missing)
+
     def test_windows_skips_directory_fsync_but_publishes_with_file_fsync(self) -> None:
         config = _training_config()
         optimization = OptimizationConfig.for_profile("pilot")

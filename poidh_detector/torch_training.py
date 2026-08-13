@@ -915,9 +915,17 @@ def _interrupt(hook: InterruptionHook | None, stage: str) -> None:
         hook(stage)
 
 
-def _fsync_file(path: Path) -> None:
-    with path.open("rb") as stream:
-        os.fsync(stream.fileno())
+def _fsync_file(
+    path: Path,
+    *,
+    open_file: Callable[[Path, str], Any] | None = None,
+    fsync_descriptor: Callable[[int], object] | None = None,
+) -> None:
+    open_file = open_file or (lambda target, mode: target.open(mode))
+    fsync_descriptor = fsync_descriptor or os.fsync
+    with open_file(path, "r+b") as stream:
+        stream.flush()
+        fsync_descriptor(stream.fileno())
 
 
 def _fsync_directory(
