@@ -419,14 +419,14 @@ def _publish_bundle(
             )
             ready_temporary = None
             os.fsync(staging_descriptor)
+            os.fsync(parent_descriptor)
+            _require_directory_identity(destination, staging_descriptor)
             _verify_staged_bundle(
                 staging_descriptor,
                 model_descriptor,
                 metadata_descriptor,
                 metadata,
             )
-            os.fsync(parent_descriptor)
-            _require_directory_identity(destination, staging_descriptor)
             publication_descriptor = os.dup(staging_descriptor)
         except BaseException:
             _hide_visible_failed_publication(parent_descriptor, destination.name)
