@@ -114,7 +114,7 @@ fi
 
 module --force purge
 module load cluster/wice/gpu_h100
-module load PyTorch/2.9.1-foss-2025a-CUDA-12.8.0-whl
+module load PyTorch-bundle/2.9.1-foss-2025a-CUDA-12.8.0-whl
 
 export PYTHONHASHSEED=323
 export CUBLAS_WORKSPACE_CONFIG=:4096:8

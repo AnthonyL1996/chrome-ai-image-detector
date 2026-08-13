@@ -66,7 +66,7 @@ fi
 
 module --force purge
 module load cluster/wice/gpu_h100
-module load PyTorch/2.9.1-foss-2025a-CUDA-12.8.0-whl
+module load PyTorch-bundle/2.9.1-foss-2025a-CUDA-12.8.0-whl
 
 export PYTHONHASHSEED=323
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
@@ -77,6 +77,10 @@ python - <<'PY'
 import torch
 import torchvision
 
+if torch.__version__.split("+", 1)[0] != "2.9.1":
+    raise RuntimeError(f"expected torch 2.9.1, found {torch.__version__}")
+if torchvision.__version__.split("+", 1)[0] != "0.24.1":
+    raise RuntimeError(f"expected torchvision 0.24.1, found {torchvision.__version__}")
 if not torch.cuda.is_available():
     raise RuntimeError("the requested H100 is not visible to PyTorch")
 

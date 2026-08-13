@@ -42,8 +42,9 @@ wheel below scratch. Do **not** load the wICE H100/PyTorch module or run its
 Zen4-optimized Python on Genius: that Python targets a different CPU and has
 been observed to exit with `SIGILL` (`132`). `--no-deps` is intentional because
 the compute job obtains torch, torchvision, and the remaining runtime stack
-from the pinned wICE module. For account `vsc38129`, this target is currently
-staged at `/scratch/leuven/381/vsc38129/poidh-python/timm-1.0.28`.
+from the pinned wICE PyTorch bundle. For account `vsc38129`, this target is
+currently staged at
+`/scratch/leuven/381/vsc38129/poidh-python/timm-1.0.28`.
 
 ```bash
 ssh "${VSC_LOGIN}"
@@ -91,8 +92,11 @@ SMOKE_JOB_ID="$(sbatch --parsable --output="${POIDH_RUN_ROOT}/logs/h100-smoke-%j
 printf 'smoke job: %s\n' "${SMOKE_JOB_ID}"
 ```
 
-The smoke job is hard-capped at `00:10:00` and runs `nvidia-smi` plus imports
-for PyTorch, torchvision, and timm. It does not train or modify the dataset.
+The smoke job is hard-capped at `00:10:00` and loads
+`PyTorch-bundle/2.9.1-foss-2025a-CUDA-12.8.0-whl`, then runs `nvidia-smi` and
+version-checks torch 2.9.1 (accepting its `+cu128` suffix), torchvision 0.24.1,
+and timm 1.0.28. It prints the observed versions and does not train or modify
+the dataset.
 `--export=NONE` prevents unrelated login-shell variables, including accidental
 credentials, from entering the job. Scratch paths are non-secret positional
 arguments; Slurm still supplies its `SLURM_*` variables, and the scripts use a

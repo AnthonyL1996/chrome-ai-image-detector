@@ -24,7 +24,7 @@ REQUIRED_SBATCH = {
 REQUIRED_MODULE_COMMANDS = (
     "module --force purge",
     "module load cluster/wice/gpu_h100",
-    "module load PyTorch/2.9.1-foss-2025a-CUDA-12.8.0-whl",
+    "module load PyTorch-bundle/2.9.1-foss-2025a-CUDA-12.8.0-whl",
 )
 
 
@@ -189,6 +189,9 @@ class HpcScriptContracts(unittest.TestCase):
         self.assertIn("import torch", script)
         self.assertIn("import timm", script)
         self.assertIn("torch.cuda.is_available()", script)
+        self.assertIn('torch.__version__.split("+", 1)[0] != "2.9.1"', script)
+        self.assertIn('torchvision.__version__.split("+", 1)[0] != "0.24.1"', script)
+        self.assertIn('timm.__version__ != "1.0.28"', script)
         self.assertLess(script.index("import torch"), script.index("import timm"))
         self.assertLess(
             script.index('"torch": torch.__version__'), script.index("import timm")
@@ -307,6 +310,7 @@ class HpcScriptContracts(unittest.TestCase):
             "--export=NONE",
             "--no-deps --target",
             "timm==1.0.28",
+            "PyTorch-bundle/2.9.1-foss-2025a-CUDA-12.8.0-whl",
         )
         for command in required_commands:
             with self.subTest(command=command):
