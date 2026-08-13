@@ -9,28 +9,53 @@ const { collectImageCandidates, resultLabel, scanPage } = globalThis.POIDHConten
 
 function fakePage(images) {
   const annotations = [];
+  const liveRegions = [];
   const oldAnnotation = { removed: false, remove() { this.removed = true; } };
   for (const image of images) {
+    const attributes = new Map();
     image.after = (annotation) => annotations.push(annotation);
+    image.getAttribute = (name) => attributes.get(name) ?? null;
+    image.setAttribute = (name, value) => attributes.set(name, String(value));
+    image.removeAttribute = (name) => attributes.delete(name);
   }
+  const createElement = (tagName) => ({
+    tagName,
+    attributes: new Map(),
+    children: [],
+    className: "",
+    dataset: {},
+    id: "",
+    removed: false,
+    tabIndex: -1,
+    textContent: "",
+    append(...children) { this.children.push(...children); },
+    appendChild(child) { this.children.push(child); return child; },
+    attachShadow() {
+      this.shadowRootCreated = true;
+      return { children: [], append: (...children) => this.shadowChildren = children };
+    },
+    getAttribute(name) { return this.attributes.get(name) ?? null; },
+    setAttribute(name, value) {
+      this.attributes.set(name, String(value));
+      this[name] = String(value);
+    },
+    remove() { this.removed = true; },
+  });
   return {
     annotations,
+    liveRegions,
     oldAnnotation,
     root: {
-      createElement: () => ({
-        className: "",
-        dataset: {},
-        setAttribute(name, value) { this[name] = value; },
-        tabIndex: -1,
-        textContent: "",
-      }),
+      baseURI: "https://example.test/page",
+      body: { append: (node) => liveRegions.push(node) },
+      createElement,
       querySelectorAll: (selector) =>
         selector === "img" ? images : selector === ".poidh-ai-result" ? [oldAnnotation] : [],
     },
   };
 }
 
-test("collectImageCandidates returns every ordinary webpage image element", () => {
+test("collectImageCandidates deduplicates canonical sources", () => {
   const images = [
     { currentSrc: "https://example.test/a.png", src: "ignored", alt: "first" },
     { currentSrc: "", src: "https://example.test/b.jpg", alt: "" },
@@ -42,7 +67,6 @@ test("collectImageCandidates returns every ordinary webpage image element", () =
   assert.deepEqual(collectImageCandidates(root), [
     { id: "image-1", source: "https://example.test/a.png", alt: "first" },
     { id: "image-2", source: "https://example.test/b.jpg", alt: "" },
-    { id: "image-3", source: "https://example.test/a.png", alt: "duplicate" },
   ]);
 });
 
@@ -59,10 +83,11 @@ test("resultLabel never presents unavailable inference as a confidence", () => {
   );
 });
 
-test("scanPage creates accessible per-image status and applies local errors", async () => {
+test("scanPage fans out deduplicated results with one non-focusable live summary", async () => {
   const page = fakePage([
     { currentSrc: "https://example.test/a.png", src: "", alt: "A diagram" },
-    { currentSrc: "", src: "", alt: "not loaded" },
+    { currentSrc: "https://example.test/a.png#fragment", src: "", alt: "Duplicate" },
+    { currentSrc: "", src: "", alt: "unresolved" },
   ]);
   const messages = [];
 
@@ -84,7 +109,7 @@ test("scanPage creates accessible per-image status and applies local errors", as
     },
   });
 
-  assert.equal(page.oldAnnotation.removed, true);
+  assert.equal(page.oldAnnotation.removed, false);
   assert.deepEqual(messages, [
     {
       type: "SCORE_IMAGES",
@@ -93,13 +118,23 @@ test("scanPage creates accessible per-image status and applies local errors", as
       ],
     },
   ]);
-  assert.equal(page.annotations[0].role, "status");
-  assert.equal(page.annotations[0].tabIndex, 0);
-  assert.equal(
-    page.annotations[0].textContent,
-    "Local AI confidence unavailable: Local model runtime is not bundled yet.",
-  );
-  assert.deepEqual(summary, { count: 1, errors: 1 });
+  assert.equal(page.annotations.length, 2);
+  for (const annotation of page.annotations) {
+    assert.notEqual(annotation.role, "status");
+    assert.equal(annotation.tabIndex, -1);
+    assert.equal(annotation.shadowRootCreated, true);
+    assert.equal(
+      annotation.textContent,
+      "Local AI confidence unavailable: Local model runtime is not bundled yet.",
+    );
+  }
+  assert.equal(page.liveRegions.length, 1);
+  assert.equal(page.liveRegions[0].role, "status");
+  assert.equal(page.liveRegions[0]["aria-live"], "polite");
+  assert.match(page.liveRegions[0].textContent, /2 images.*1 skipped/i);
+  assert.match(page.root.querySelectorAll("img")[0].getAttribute("aria-describedby"), /poidh/);
+  assert.match(page.root.querySelectorAll("img")[1].getAttribute("aria-describedby"), /poidh/);
+  assert.deepEqual(summary, { count: 2, errors: 2, skipped: 1 });
 });
 
 test("scanPage turns messaging failures into visible per-image errors", async () => {
@@ -115,5 +150,34 @@ test("scanPage turns messaging failures into visible per-image errors", async ()
   });
 
   assert.match(page.annotations[0].textContent, /Scan failed locally/);
-  assert.deepEqual(summary, { count: 1, errors: 1 });
+  assert.deepEqual(summary, { count: 1, errors: 1, skipped: 0 });
+});
+
+test("scanPage removes only nodes it owns and restores image descriptions", async () => {
+  const image = { currentSrc: "https://example.test/a.png", src: "", alt: "A" };
+  const page = fakePage([image]);
+  image.setAttribute("aria-describedby", "page-description");
+
+  await scanPage({
+    root: page.root,
+    sendMessage: async () => ({
+      ok: true,
+      results: [{ id: "image-1", status: "ok", confidence: 0.5 }],
+    }),
+  });
+  const firstAnnotation = page.annotations[0];
+  const firstLiveRegion = page.liveRegions[0];
+
+  await scanPage({
+    root: page.root,
+    sendMessage: async () => ({
+      ok: true,
+      results: [{ id: "image-1", status: "ok", confidence: 0.6 }],
+    }),
+  });
+
+  assert.equal(firstAnnotation.removed, true);
+  assert.equal(firstLiveRegion.removed, true);
+  assert.equal(page.oldAnnotation.removed, false);
+  assert.match(image.getAttribute("aria-describedby"), /^page-description poidh/);
 });
