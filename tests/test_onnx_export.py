@@ -12,6 +12,7 @@ from poidh_detector.calibration import (
     CalibrationClassCounts,
     PlattCalibrationArtifact,
 )
+from poidh_detector.calibration_fit import CalibrationFitResult, CalibrationMetrics
 from poidh_detector.onnx_export import export_detector_onnx
 from poidh_detector.training import TrainingConfig
 from tools.export_detector_onnx import main
@@ -198,21 +199,36 @@ class OnnxExporterTests(unittest.TestCase):
         calibration_checkpoint_sha256: str | None = None,
         calibration_config: TrainingConfig | None = None,
     ) -> dict[str, Path]:
-        root.mkdir(parents=True)
+        root.mkdir(parents=True, exist_ok=True)
         dataset_manifest = b'[{"frozen":"dataset"}]\n'
         checkpoint = b"frozen-convnextv2-nano-state"
         config = _config(dataset_manifest)
-        calibration = PlattCalibrationArtifact(
-            scale=1.75,
-            bias=-0.25,
-            checkpoint_sha256=(calibration_checkpoint_sha256 or _sha256(checkpoint)),
-            calibration_split_sha256=(
-                calibration_config or config
-            ).calibration_split_sha256,
-            training_config=calibration_config or config,
-            input_identifier="calibration",
-            sample_count=4,
-            class_counts=CalibrationClassCounts(real=2, ai=2),
+        calibration = CalibrationFitResult(
+            artifact=PlattCalibrationArtifact(
+                scale=1.75,
+                bias=-0.25,
+                checkpoint_sha256=(
+                    calibration_checkpoint_sha256 or _sha256(checkpoint)
+                ),
+                calibration_split_sha256=(
+                    calibration_config or config
+                ).calibration_split_sha256,
+                training_config=calibration_config or config,
+                input_identifier="calibration",
+                sample_count=4,
+                class_counts=CalibrationClassCounts(real=2, ai=2),
+            ),
+            predictions_sha256="e" * 64,
+            uncalibrated=CalibrationMetrics(
+                bce=0.7,
+                ece=0.2,
+                accuracy_at_threshold=0.5,
+            ),
+            calibrated=CalibrationMetrics(
+                bce=0.6,
+                ece=0.1,
+                accuracy_at_threshold=0.75,
+            ),
         )
         payloads = {
             "checkpoint": checkpoint,
