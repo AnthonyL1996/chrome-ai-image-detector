@@ -507,13 +507,15 @@ class OnnxExporterTests(unittest.TestCase):
                         destination.rename(displaced)
                         destination.mkdir()
 
-                    real_fsync_file = onnx_export._fsync_file
+                    real_write_file_at = onnx_export._write_file_at
 
-                    def fail_after_token(path: Path) -> None:
-                        if path.name == ".reservation":
+                    def fail_after_token(
+                        descriptor: int, name: str, payload: bytes
+                    ) -> None:
+                        if name == ".reservation":
                             replace_destination()
                             raise RuntimeError("fault after token")
-                        real_fsync_file(path)
+                        real_write_file_at(descriptor, name, payload)
 
                     if replacement_stage == "before-token":
 
@@ -526,7 +528,7 @@ class OnnxExporterTests(unittest.TestCase):
                         )
                     else:
                         failure = patch.object(
-                            onnx_export, "_fsync_file", fail_after_token
+                            onnx_export, "_write_file_at", fail_after_token
                         )
 
                     with failure:
@@ -580,34 +582,21 @@ class OnnxExporterTests(unittest.TestCase):
             destination = paths["output"].absolute()
             displaced = destination.with_name("displaced-export")
             foreign_file = destination / "foreign.txt"
-            real_fsync_directory = onnx_export._fsync_directory
-            destination_syncs = 0
+            real_require_identity = onnx_export._require_directory_identity
+            identity_checks = 0
 
-            def fail_second_destination_sync(path: Path, **kwargs: object) -> None:
-                nonlocal destination_syncs
-                if path == destination:
-                    destination_syncs += 1
-                    if destination_syncs == 2:
-                        raise RuntimeError("publish fault")
-                real_fsync_directory(path, **kwargs)
-
-            real_read_text = Path.read_text
-
-            def replace_after_read(
-                path: Path, encoding: str | None = None, errors: str | None = None
-            ) -> str:
-                payload = real_read_text(path, encoding=encoding, errors=errors)
-                if path == destination / ".reservation":
+            def replace_after_identity(path: Path, descriptor: int) -> None:
+                nonlocal identity_checks
+                real_require_identity(path, descriptor)
+                identity_checks += 1
+                if identity_checks == 4:
                     destination.rename(displaced)
                     destination.mkdir()
                     foreign_file.write_text("foreign", encoding="ascii")
-                return payload
+                    raise RuntimeError("publish fault")
 
-            with (
-                patch.object(
-                    onnx_export, "_fsync_directory", fail_second_destination_sync
-                ),
-                patch.object(Path, "read_text", replace_after_read),
+            with patch.object(
+                onnx_export, "_require_directory_identity", replace_after_identity
             ):
                 with self.assertRaisesRegex(RuntimeError, "publish fault"):
                     export_detector_onnx(

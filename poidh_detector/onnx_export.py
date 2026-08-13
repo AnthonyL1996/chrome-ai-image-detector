@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import stat
 import tempfile
 from typing import Any
 
@@ -332,61 +333,102 @@ def _load_export_metadata(payload: bytes) -> ExportMetadata:
 
 
 def _publish_bundle(staging: Path, destination: Path, metadata: ExportMetadata) -> None:
-    owns_destination = False
-    reservation_token: str | None = None
-    ready_temporary: Path | None = None
+    _require_secure_directory_operations()
     try:
-        try:
-            destination.mkdir(mode=0o700)
-        except FileExistsError as error:
-            raise FileExistsError(
-                f"ONNX export output already exists: {destination}"
-            ) from error
-        owns_destination = True
+        destination.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise FileExistsError(
+            f"ONNX export output already exists: {destination}"
+        ) from error
 
+    directory_descriptor = _open_directory(destination)
+    ready_temporary: str | None = None
+    try:
+        _require_directory_identity(destination, directory_descriptor)
         reservation_token = secrets.token_hex(32)
-        reservation = destination / ".reservation"
-        reservation.write_text(reservation_token, encoding="ascii")
-        _fsync_file(reservation)
-        _fsync_directory(destination)
+        _require_directory_identity(destination, directory_descriptor)
+        _write_file_at(
+            directory_descriptor,
+            ".reservation",
+            reservation_token.encode("ascii"),
+        )
+        os.fsync(directory_descriptor)
         _fsync_directory(destination.parent)
 
-        (staging / _MODEL_NAME).replace(destination / _MODEL_NAME)
-        (staging / _METADATA_NAME).replace(destination / _METADATA_NAME)
-        _fsync_directory(destination)
+        _require_directory_identity(destination, directory_descriptor)
+        _move_file_at(staging / _MODEL_NAME, directory_descriptor, _MODEL_NAME)
+        _move_file_at(staging / _METADATA_NAME, directory_descriptor, _METADATA_NAME)
+        os.fsync(directory_descriptor)
 
         ready_payload = (_sha256(metadata.to_json_bytes()) + "\n").encode("ascii")
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{_READY_NAME}.", suffix=".tmp", dir=destination
-        )
-        ready_temporary = Path(temporary_name)
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(ready_payload)
-            stream.flush()
-            os.fsync(stream.fileno())
+        ready_temporary = f".{_READY_NAME}.{reservation_token}.tmp"
+        _write_file_at(directory_descriptor, ready_temporary, ready_payload)
 
-        reservation.unlink()
-        owns_destination = False
-        os.replace(ready_temporary, destination / _READY_NAME)
+        _require_directory_identity(destination, directory_descriptor)
+        os.unlink(".reservation", dir_fd=directory_descriptor)
+        os.rename(
+            ready_temporary,
+            _READY_NAME,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
         ready_temporary = None
-        _fsync_directory(destination)
+        os.fsync(directory_descriptor)
+        _require_directory_identity(destination, directory_descriptor)
         _fsync_directory(destination.parent)
     finally:
-        if ready_temporary is not None and os.path.lexists(ready_temporary):
-            ready_temporary.unlink()
-        if (
-            owns_destination
-            and reservation_token is not None
-            and not os.path.lexists(destination / _READY_NAME)
-        ):
-            reservation = destination / ".reservation"
+        if ready_temporary is not None:
             try:
-                owned = reservation.read_text(encoding="ascii") == reservation_token
-            except OSError:
-                owned = False
-            if owned:
-                shutil.rmtree(destination)
-                _fsync_directory(destination.parent)
+                os.unlink(ready_temporary, dir_fd=directory_descriptor)
+            except FileNotFoundError:
+                pass
+        os.close(directory_descriptor)
+
+
+def _require_secure_directory_operations() -> None:
+    required = (os.open, os.rename, os.unlink)
+    if any(operation not in os.supports_dir_fd for operation in required):
+        raise RuntimeError(
+            "secure ONNX publication requires directory-relative filesystem operations"
+        )
+
+
+def _open_directory(path: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        _require_directory_identity(path, descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _require_directory_identity(path: Path, descriptor: int) -> None:
+    try:
+        visible = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise RuntimeError("ONNX export destination identity changed") from error
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(visible.st_mode)
+        or visible.st_dev != opened.st_dev
+        or visible.st_ino != opened.st_ino
+    ):
+        raise RuntimeError("ONNX export destination identity changed")
+
+
+def _write_file_at(directory_descriptor: int, name: str, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_descriptor)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _move_file_at(source: Path, directory_descriptor: int, name: str) -> None:
+    os.rename(source, name, dst_dir_fd=directory_descriptor)
 
 
 def _onnx_tensor(value: Any, onnx: Any) -> OnnxTensor:
