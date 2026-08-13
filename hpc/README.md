@@ -35,20 +35,59 @@ Do not transfer SSH keys, tokens, `.env` files, third-party pretrained weights,
 or unreviewed data. Re-run both `rsync` commands whenever code or prepared data
 changes; neither command deletes remote files.
 
+## Stage the pure-Python dependency once
+
+On the Genius login node, use the system Python to stage the pure-Python timm
+wheel below scratch. Do **not** load the wICE H100/PyTorch module or run its
+Zen4-optimized Python on Genius: that Python targets a different CPU and has
+been observed to exit with `SIGILL` (`132`). `--no-deps` is intentional because
+the compute job obtains torch, torchvision, and the remaining runtime stack
+from the pinned wICE module. For account `vsc38129`, this target is currently
+staged at `/scratch/leuven/381/vsc38129/poidh-python/timm-1.0.28`.
+
+```bash
+ssh "${VSC_LOGIN}"
+export POIDH_PYTHON_DEPS="${VSC_SCRATCH}/poidh-python/timm-1.0.28"
+if [[ ! -e "${POIDH_PYTHON_DEPS}" ]]; then
+    mkdir -p "$(dirname "${POIDH_PYTHON_DEPS}")"
+    python3 -m pip install --no-deps --target "${POIDH_PYTHON_DEPS}" 'timm==1.0.28'
+fi
+python3 - <<'PY'
+import os
+from importlib.metadata import distributions
+
+installed = {
+    distribution.metadata["Name"]: distribution.version
+    for distribution in distributions(path=[os.environ["POIDH_PYTHON_DEPS"]])
+}
+if installed.get("timm") != "1.0.28":
+    raise SystemExit(f"unexpected staged packages: {installed}")
+print(installed)
+PY
+```
+
+This login-node check verifies the wheel metadata without importing the
+compute-only PyTorch stack. The H100 smoke performs the real imports and prints
+torch/torchvision diagnostics before it attempts timm. Stop if either check
+fails. Package installation belongs only in this one-time login-node step;
+neither compute script runs pip or accesses the network. Recreate the target
+directory rather than modifying it during a job.
+
 ## Submit the environment smoke
 
-Log in, define the two required scratch paths, and submit from the repository
-root. Both scripts reject data or run paths that resolve outside
-`VSC_SCRATCH`.
+Log in, define the required scratch-backed data, run, and dependency paths,
+and submit from the repository root. Both scripts reject any of those paths
+when its canonical location resolves outside `VSC_SCRATCH`.
 
 ```bash
 ssh "${VSC_LOGIN}"
 cd "${VSC_SCRATCH}/poidh-ai-detector"
-export POIDH_DATA_ROOT="${VSC_SCRATCH}/poidh-data/monet-v1"
-export POIDH_RUN_ROOT="${VSC_SCRATCH}/poidh-runs"
+POIDH_DATA_ROOT="${VSC_SCRATCH}/poidh-data/monet-v1"
+POIDH_RUN_ROOT="${VSC_SCRATCH}/poidh-runs"
+POIDH_PYTHON_DEPS="${VSC_SCRATCH}/poidh-python/timm-1.0.28"
 mkdir -p "${POIDH_RUN_ROOT}/logs"
 
-SMOKE_JOB_ID="$(sbatch --parsable --output="${POIDH_RUN_ROOT}/logs/h100-smoke-%j.out" --export=NONE hpc/wice_h100_smoke.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}")"
+SMOKE_JOB_ID="$(sbatch --parsable --output="${POIDH_RUN_ROOT}/logs/h100-smoke-%j.out" --export=NONE hpc/wice_h100_smoke.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${POIDH_PYTHON_DEPS}")"
 printf 'smoke job: %s\n' "${SMOKE_JOB_ID}"
 ```
 
@@ -71,7 +110,7 @@ walltime override. `TRAIN_PROFILE` accepts `overfit`, `smoke`, `pilot`, or
 ```bash
 TRAIN_PROFILE="pilot"
 TRAIN_WALLTIME="02:00:00"
-TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=NONE hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${TRAIN_PROFILE}" 0)"
+TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=NONE hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${POIDH_PYTHON_DEPS}" "${TRAIN_PROFILE}" 0)"
 printf 'training job: %s\n' "${TRAIN_JOB_ID}"
 ```
 
@@ -87,7 +126,7 @@ name and pass the explicit resume flag:
 TRAIN_PROFILE="pilot"
 TRAIN_WALLTIME="02:00:00"
 POIDH_RUN_NAME="pilot-12345678"
-TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=NONE hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${TRAIN_PROFILE}" 1 "${POIDH_RUN_NAME}")"
+TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=NONE hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${POIDH_PYTHON_DEPS}" "${TRAIN_PROFILE}" 1 "${POIDH_RUN_NAME}")"
 ```
 
 The script rejects a pre-existing fresh-run path. Resume requires an existing,

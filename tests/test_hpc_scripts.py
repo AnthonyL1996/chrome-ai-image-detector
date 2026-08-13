@@ -13,6 +13,7 @@ HPC_ROOT = REPOSITORY_ROOT / "hpc"
 SMOKE_PATH = HPC_ROOT / "wice_h100_smoke.slurm"
 TRAIN_PATH = HPC_ROOT / "wice_h100_train.slurm"
 README_PATH = HPC_ROOT / "README.md"
+MODULE_PYTHONPATH = "/module/python:/module/torch"
 
 REQUIRED_SBATCH = {
     "account": "lp_edu_maibi_anndl",
@@ -55,44 +56,89 @@ def _run_training_script(
     *,
     run_name: str,
     resume: bool,
-) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    dependency_mode: str = "valid",
+    script_path: Path = TRAIN_PATH,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
     root = Path(temporary)
     scratch = root / "scratch"
     data_root = scratch / "data"
     run_root = scratch / "runs"
     fake_bin = root / "bin"
     invocation_log = root / "python-arguments.txt"
+    pythonpath_log = root / "pythonpath.txt"
     for directory in (data_root, run_root, fake_bin):
         directory.mkdir(parents=True, exist_ok=True)
     _write_executable(fake_bin / "module", "#!/bin/sh\nexit 0\n")
     _write_executable(fake_bin / "nvidia-smi", "#!/bin/sh\nexit 0\n")
+
+    if dependency_mode == "outside":
+        dependency_root = root / "outside-dependencies"
+    else:
+        dependency_root = scratch / "python-dependencies"
+    if dependency_mode != "missing":
+        dependency_root.mkdir(parents=True)
+    if dependency_mode in {"valid", "outside"}:
+        (dependency_root / "timm").mkdir()
+        (dependency_root / "timm" / "__init__.py").write_text(
+            '__version__ = "1.0.28"\n',
+            encoding="utf-8",
+        )
+        (dependency_root / "timm-1.0.28.dist-info").mkdir()
+
     _write_executable(
         fake_bin / "python",
-        '#!/bin/sh\nprintf "%s\\n" "$@" > "$INVOCATION_LOG"\n',
+        '#!/bin/sh\nprintf "%s\\n" "$PYTHONPATH" > "$PYTHONPATH_LOG"\nprintf "%s\\n" "$@" > "$INVOCATION_LOG"\n',
     )
     environment = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "INVOCATION_LOG": str(invocation_log),
-        "POIDH_DATA_ROOT": str(data_root),
-        "POIDH_RUN_NAME": run_name,
-        "POIDH_RUN_ROOT": str(run_root),
+        "PYTHONPATH": MODULE_PYTHONPATH,
+        "PYTHONPATH_LOG": str(pythonpath_log),
         "SLURM_CPUS_PER_TASK": "3",
         "SLURM_JOB_ID": "12345",
         "SLURM_SUBMIT_DIR": str(REPOSITORY_ROOT),
-        "TRAIN_PROFILE": "pilot",
-        "TRAIN_RESUME": "1" if resume else "0",
-        "VSC_SCRATCH": str(scratch),
     }
+    for variable in (
+        "POIDH_DATA_ROOT",
+        "POIDH_PYTHON_DEPS",
+        "POIDH_RUN_NAME",
+        "POIDH_RUN_ROOT",
+        "TRAIN_PROFILE",
+        "TRAIN_RESUME",
+        "VSC_SCRATCH",
+    ):
+        environment.pop(variable, None)
+    if script_path == SMOKE_PATH:
+        command = [
+            "bash",
+            str(script_path),
+            str(scratch),
+            str(data_root),
+            str(run_root),
+            str(dependency_root),
+        ]
+    else:
+        command = [
+            "bash",
+            str(script_path),
+            str(scratch),
+            str(data_root),
+            str(run_root),
+            str(dependency_root),
+            "pilot",
+            "1" if resume else "0",
+            run_name,
+        ]
     completed = subprocess.run(
-        ["bash", str(TRAIN_PATH)],
+        command,
         cwd=REPOSITORY_ROOT,
         env=environment,
         capture_output=True,
         text=True,
         check=False,
     )
-    return completed, invocation_log, run_root
+    return completed, invocation_log, run_root, pythonpath_log
 
 
 class HpcScriptContracts(unittest.TestCase):
@@ -130,8 +176,12 @@ class HpcScriptContracts(unittest.TestCase):
                     '${POIDH_DATA_ROOT:?"POIDH_DATA_ROOT must be set"}', script
                 )
                 self.assertIn('${POIDH_RUN_ROOT:?"POIDH_RUN_ROOT must be set"}', script)
+                self.assertIn(
+                    '${POIDH_PYTHON_DEPS:?"POIDH_PYTHON_DEPS must be set"}', script
+                )
                 self.assertIn('case "${DATA_ROOT}" in', script)
                 self.assertIn('case "${RUN_ROOT}" in', script)
+                self.assertIn('case "${DEPENDENCY_ROOT}" in', script)
 
     def test_smoke_job_checks_gpu_and_python_imports(self) -> None:
         script = _read(SMOKE_PATH)
@@ -139,6 +189,10 @@ class HpcScriptContracts(unittest.TestCase):
         self.assertIn("import torch", script)
         self.assertIn("import timm", script)
         self.assertIn("torch.cuda.is_available()", script)
+        self.assertLess(script.index("import torch"), script.index("import timm"))
+        self.assertLess(
+            script.index('"torch": torch.__version__'), script.index("import timm")
+        )
 
     def test_training_job_uses_environment_profile_and_training_entrypoint(
         self,
@@ -153,10 +207,14 @@ class HpcScriptContracts(unittest.TestCase):
 
     def test_fresh_training_accepts_only_an_absent_run_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            completed, invocation_log, run_root = _run_training_script(
+            completed, invocation_log, run_root, pythonpath_log = _run_training_script(
                 temporary, run_name="fresh", resume=False
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                pythonpath_log.read_text(encoding="utf-8").strip(),
+                f"{(Path(temporary) / 'scratch' / 'python-dependencies').resolve()}:{MODULE_PYTHONPATH}",
+            )
             arguments = invocation_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(arguments[0], "tools/train_detector.py")
             self.assertEqual(arguments[2], str(run_root.resolve() / "fresh"))
@@ -165,7 +223,7 @@ class HpcScriptContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             existing = Path(temporary) / "scratch" / "runs" / "existing"
             existing.mkdir(parents=True)
-            completed, invocation_log, _ = _run_training_script(
+            completed, invocation_log, _, _ = _run_training_script(
                 temporary, run_name="existing", resume=False
             )
             self.assertNotEqual(completed.returncode, 0)
@@ -175,10 +233,11 @@ class HpcScriptContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             existing = Path(temporary) / "scratch" / "runs" / "existing"
             existing.mkdir(parents=True)
-            completed, invocation_log, run_root = _run_training_script(
+            completed, invocation_log, run_root, pythonpath_log = _run_training_script(
                 temporary, run_name="existing", resume=True
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(pythonpath_log.is_file())
             arguments = invocation_log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(arguments[2], str(run_root.resolve() / "existing"))
             self.assertIn("--resume", arguments)
@@ -189,11 +248,51 @@ class HpcScriptContracts(unittest.TestCase):
             outside.mkdir()
             link.parent.mkdir(parents=True)
             link.symlink_to(outside, target_is_directory=True)
-            completed, invocation_log, _ = _run_training_script(
+            completed, invocation_log, _, _ = _run_training_script(
                 temporary, run_name="escaped", resume=True
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertFalse(invocation_log.exists())
+
+    def test_training_rejects_missing_invalid_or_external_dependency_root(self) -> None:
+        for mode in ("missing", "bad", "outside"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                completed, invocation_log, _, pythonpath_log = _run_training_script(
+                    temporary,
+                    run_name="fresh",
+                    resume=False,
+                    dependency_mode=mode,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertFalse(invocation_log.exists())
+                self.assertFalse(pythonpath_log.exists())
+
+    def test_smoke_uses_only_a_valid_contained_dependency_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            completed, _, _, pythonpath_log = _run_training_script(
+                temporary,
+                run_name="unused",
+                resume=False,
+                script_path=SMOKE_PATH,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                pythonpath_log.read_text(encoding="utf-8").strip(),
+                f"{(Path(temporary) / 'scratch' / 'python-dependencies').resolve()}:{MODULE_PYTHONPATH}",
+            )
+
+        for mode in ("missing", "bad", "outside"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                completed, invocation_log, _, pythonpath_log = _run_training_script(
+                    temporary,
+                    run_name="unused",
+                    resume=False,
+                    dependency_mode=mode,
+                    script_path=SMOKE_PATH,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertFalse(invocation_log.exists())
+                self.assertFalse(pythonpath_log.exists())
 
     def test_readme_gives_exact_transfer_submit_and_monitor_commands(self) -> None:
         readme = _read(README_PATH)
@@ -206,11 +305,21 @@ class HpcScriptContracts(unittest.TestCase):
             "sacct -j",
             "tail -f",
             "--export=NONE",
+            "--no-deps --target",
+            "timm==1.0.28",
         )
         for command in required_commands:
             with self.subTest(command=command):
                 self.assertIn(command, readme)
         self.assertNotIn("--export=ALL", readme)
+        self.assertIn('"${POIDH_PYTHON_DEPS}"', readme)
+
+    def test_compute_jobs_never_install_or_download_packages(self) -> None:
+        for path in (SMOKE_PATH, TRAIN_PATH):
+            with self.subTest(path=path.name):
+                script = _read(path)
+                self.assertNotRegex(script, r"(?i)\b(?:pip|uv|conda)\s+install\b")
+                self.assertNotRegex(script, r"(?i)\b(?:curl|wget)\b")
 
     def test_readme_states_cost_and_bart_first_policy(self) -> None:
         readme = _read(README_PATH)
