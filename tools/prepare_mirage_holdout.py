@@ -24,6 +24,8 @@ from poidh_benchmark.mirage import (  # noqa: E402
     commit_staging_directory,
     git_provenance,
     materialize_entry,
+    read_prior_manifest,
+    reject_prior_content_overlap,
     validate_materialized_entries,
 )
 
@@ -56,6 +58,14 @@ def parse_args() -> argparse.Namespace:
         help="Reconstruct the already-viewed streamed development slice.",
     )
     parser.add_argument("--exclude-count", type=int, default=400)
+    parser.add_argument(
+        "--exclude-manifest",
+        type=Path,
+        action="append",
+        default=[],
+        help="Exclude every file_name from a previously frozen manifest.",
+    )
+    parser.add_argument("--selection-seed", default=SELECTION_SEED)
     return parser.parse_args()
 
 
@@ -115,13 +125,28 @@ def main() -> None:
         if len(excluded_file_names) != args.exclude_count:
             raise RuntimeError("could not reconstruct the full excluded slice")
 
+    prior_exclusions = [
+        read_prior_manifest(
+            path,
+            expected_dataset_id=DATASET_ID,
+            expected_revision=DATASET_REVISION,
+        )
+        for path in args.exclude_manifest
+    ]
+    for prior in prior_exclusions:
+        excluded_file_names.update(prior.file_names)
+    known_file_names = {row.file_name for row in rows}
+    unknown_exclusions = excluded_file_names - known_file_names
+    if unknown_exclusions:
+        preview = ", ".join(sorted(unknown_exclusions)[:3])
+        raise ValueError(f"excluded names missing from pinned metadata: {preview}")
     eligible_rows = [row for row in rows if row.file_name not in excluded_file_names]
     selected = select_balanced_generator_strata(
         eligible_rows,
         content_types=CONTENT_TYPES,
         fake_generators=FAKE_GENERATORS,
         per_class_per_content=args.per_class_per_content,
-        seed=SELECTION_SEED,
+        seed=args.selection_seed,
     )
 
     args.output_root.parent.mkdir(parents=True, exist_ok=True)
@@ -143,7 +168,7 @@ def main() -> None:
                     output_root=images_root,
                     dataset_id=DATASET_ID,
                     revision=DATASET_REVISION,
-                    selection_seed=SELECTION_SEED,
+                    selection_seed=args.selection_seed,
                     fetch=_download_with_retries,
                 ): row
                 for row in selected
@@ -156,6 +181,7 @@ def main() -> None:
         content_hashes = [entry["content_sha256"] for entry in entries]
         if len(content_hashes) != len(set(content_hashes)):
             raise RuntimeError("duplicate image content detected in frozen holdout")
+        reject_prior_content_overlap(content_hashes, prior_exclusions)
 
         entries.sort(key=lambda entry: str(entry["file_name"]))
         validate_materialized_entries(images_root, entries)
@@ -188,15 +214,29 @@ def main() -> None:
                 "huggingface_hub_version": huggingface_hub.__version__,
             },
             "selection": {
-                "seed": SELECTION_SEED,
+                "seed": args.selection_seed,
                 "content_types": list(CONTENT_TYPES),
                 "fake_generators": list(FAKE_GENERATORS),
                 "per_class_per_content": args.per_class_per_content,
                 "excluded_development_shuffle_seed": args.exclude_shuffle_seed,
                 "excluded_development_shuffle_buffer_size": 1_000,
-                "excluded_development_count": len(excluded_file_names),
+                "excluded_development_count": len(ordered_excluded_file_names),
                 "excluded_file_names": ordered_excluded_file_names,
                 "excluded_manifest_sha256": excluded_manifest_sha256,
+                "prior_exclusion_manifests": [
+                    {
+                        "manifest_sha256": prior.manifest_sha256,
+                        "dataset_id": prior.dataset_id,
+                        "dataset_revision": prior.dataset_revision,
+                        "excluded_count": len(prior.file_names),
+                        "entries": [
+                            {"file_name": file_name, "content_sha256": content_hash}
+                            for file_name, content_hash in prior.entries
+                        ],
+                    }
+                    for prior in prior_exclusions
+                ],
+                "total_unique_excluded_count": len(excluded_file_names),
             },
             "counts": {
                 "total": len(entries),

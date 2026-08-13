@@ -10,6 +10,8 @@ from poidh_benchmark.mirage import (
     git_provenance,
     materialize_entry,
     pinned_download_url,
+    read_prior_manifest,
+    reject_prior_content_overlap,
     validate_materialized_entries,
 )
 
@@ -148,6 +150,92 @@ class MirageMaterializationTests(unittest.TestCase):
             provenance["script_sha256"],
             hashlib.sha256(b"print('frozen')\n").hexdigest(),
         )
+
+    def test_reads_and_validates_prior_manifest_file_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory, "manifest.json")
+            manifest.write_text(
+                '{"schema_version": 1, "dataset_id": "dataset", '
+                '"dataset_revision": "revision", "entries": ['
+                '{"file_name": "a.jpg", "content_sha256": "'
+                + "a" * 64
+                + '"}, {"file_name": "b.jpg", "content_sha256": "'
+                + "b" * 64
+                + '"}]}',
+                encoding="utf-8",
+            )
+
+            prior = read_prior_manifest(
+                manifest,
+                expected_dataset_id="dataset",
+                expected_revision="revision",
+            )
+
+            self.assertEqual(prior.file_names, {"a.jpg", "b.jpg"})
+            self.assertEqual(prior.content_sha256, {"a" * 64, "b" * 64})
+            self.assertEqual(
+                prior.entries,
+                (("a.jpg", "a" * 64), ("b.jpg", "b" * 64)),
+            )
+            self.assertEqual(
+                prior.manifest_sha256,
+                hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            )
+
+    def test_rejects_duplicate_prior_manifest_file_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory, "manifest.json")
+            manifest.write_text(
+                '{"schema_version": 1, "dataset_id": "dataset", '
+                '"dataset_revision": "revision", "entries": ['
+                '{"file_name": "same.jpg", "content_sha256": "'
+                + "a" * 64
+                + '"}, {"file_name": "same.jpg", "content_sha256": "'
+                + "b" * 64
+                + '"}]}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "duplicate file_name"):
+                read_prior_manifest(
+                    manifest,
+                    expected_dataset_id="dataset",
+                    expected_revision="revision",
+                )
+
+    def test_rejects_prior_manifest_from_other_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory, "manifest.json")
+            manifest.write_text(
+                '{"schema_version": 1, "dataset_id": "dataset", '
+                '"dataset_revision": "other", "entries": []}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "dataset revision"):
+                read_prior_manifest(
+                    manifest,
+                    expected_dataset_id="dataset",
+                    expected_revision="revision",
+                )
+
+    def test_rejects_renamed_content_from_prior_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory, "manifest.json")
+            manifest.write_text(
+                '{"schema_version": 1, "dataset_id": "dataset", '
+                '"dataset_revision": "revision", "entries": ['
+                '{"file_name": "old-name.jpg", "content_sha256": "' + "a" * 64 + '"}]}',
+                encoding="utf-8",
+            )
+            prior = read_prior_manifest(
+                manifest,
+                expected_dataset_id="dataset",
+                expected_revision="revision",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "content overlap"):
+                reject_prior_content_overlap(["a" * 64], [prior])
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -14,6 +16,16 @@ from poidh_benchmark.manifest import MirageRow
 FetchBytes = Callable[[str], bytes]
 _SAFE_SEGMENT = re.compile(r"[^A-Za-z0-9._ -]+")
 _KNOWN_SUFFIXES = {".avif", ".jpeg", ".jpg", ".png", ".webp"}
+
+
+@dataclass(frozen=True, slots=True)
+class PriorManifest:
+    dataset_id: str
+    dataset_revision: str
+    entries: tuple[tuple[str, str], ...]
+    file_names: frozenset[str]
+    content_sha256: frozenset[str]
+    manifest_sha256: str
 
 
 def pinned_download_url(dataset_id: str, revision: str, file_name: str) -> str:
@@ -125,6 +137,70 @@ def git_provenance(repository: Path, script_path: Path) -> dict[str, str]:
         "git_commit": commit,
         "script_sha256": hashlib.sha256(script_path.read_bytes()).hexdigest(),
     }
+
+
+def read_prior_manifest(
+    path: Path,
+    *,
+    expected_dataset_id: str,
+    expected_revision: str,
+) -> PriorManifest:
+    payload = path.read_bytes()
+    document = json.loads(payload)
+    if not isinstance(document, dict):
+        raise ValueError("manifest root must be an object")
+    if document.get("schema_version") != 1:
+        raise ValueError("unsupported manifest schema version")
+    dataset_id = document.get("dataset_id")
+    revision = document.get("dataset_revision")
+    if dataset_id != expected_dataset_id:
+        raise ValueError("prior manifest dataset ID does not match")
+    if revision != expected_revision:
+        raise ValueError("prior manifest dataset revision does not match")
+    entries = document.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("manifest entries must be a list")
+    names: list[str] = []
+    hashes: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("every manifest entry must be an object")
+        file_name = entry.get("file_name")
+        content_hash = entry.get("content_sha256")
+        if not isinstance(file_name, str) or not file_name:
+            raise ValueError("every manifest entry must contain a file_name")
+        if (
+            not isinstance(content_hash, str)
+            or len(content_hash) != 64
+            or any(character not in "0123456789abcdef" for character in content_hash)
+        ):
+            raise ValueError("every manifest entry must contain a content SHA-256")
+        names.append(file_name)
+        hashes.append(content_hash)
+    if len(names) != len(set(names)):
+        raise ValueError("duplicate file_name in prior manifest")
+    if len(hashes) != len(set(hashes)):
+        raise ValueError("duplicate content SHA-256 in prior manifest")
+    return PriorManifest(
+        dataset_id=dataset_id,
+        dataset_revision=revision,
+        entries=tuple(sorted(zip(names, hashes, strict=True))),
+        file_names=frozenset(names),
+        content_sha256=frozenset(hashes),
+        manifest_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def reject_prior_content_overlap(
+    content_hashes: Iterable[str], prior_manifests: Iterable[PriorManifest]
+) -> None:
+    prior_hashes = {
+        digest for manifest in prior_manifests for digest in manifest.content_sha256
+    }
+    leaked_content = set(content_hashes) & prior_hashes
+    if leaked_content:
+        preview = ", ".join(sorted(leaked_content)[:3])
+        raise RuntimeError(f"content overlap with prior holdout: {preview}")
 
 
 def _safe_path_segment(value: str) -> str:
