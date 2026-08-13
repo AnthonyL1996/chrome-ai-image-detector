@@ -78,6 +78,7 @@ def main() -> None:
     arguments = _parse_arguments()
     repository = Path(__file__).resolve().parents[1]
     provenance = _capture_provenance(repository)
+    holdouts = _load_exposed_holdouts(arguments.holdout_manifest)
     destination = arguments.output.resolve()
     if os.path.lexists(destination):
         raise FileExistsError(f"output destination already exists: {destination}")
@@ -95,7 +96,6 @@ def main() -> None:
         )
         selected = select_source_quotas(rows, quotas=QUOTAS, seed=SELECTION_SEED)
         samples = sample_records_for_rows(selected)
-        holdouts = _load_exposed_holdouts(arguments.holdout_manifest)
         reject_holdout_overlap(samples, holdouts)
         materialized = materialize_selected_rows(selected, output_root=staging)
         if materialized != samples:
@@ -156,15 +156,7 @@ def _load_candidates(
     except ImportError as error:
         raise RuntimeError("huggingface_hub and pyarrow are required") from error
 
-    card_path = hf_hub_download(
-        DATASET_ID,
-        "README.md",
-        repo_type="dataset",
-        revision=DATASET_REVISION,
-        cache_dir=cache_dir,
-    )
     selected_shards: dict[str, list[str]] = {}
-    all_rows: list[MonetRow] = []
     for source, source_path in SOURCE_PATHS.items():
         wanted = real_shards if source == "commoncatalog-cc-by" else synthetic_shards
         tree = list_repo_tree(
@@ -185,6 +177,16 @@ def _load_candidates(
         if len(ranked) < wanted:
             raise RuntimeError(f"not enough parquet shards for {source}")
         selected_shards[source] = ranked[:wanted]
+
+    card_path = hf_hub_download(
+        DATASET_ID,
+        "README.md",
+        repo_type="dataset",
+        revision=DATASET_REVISION,
+        cache_dir=cache_dir,
+    )
+    all_rows: list[MonetRow] = []
+    for source in SOURCE_PATHS:
         source_rows: list[MonetRow] = []
         for shard_path in selected_shards[source]:
             local_path = hf_hub_download(
@@ -250,8 +252,14 @@ def _parse_rows(
 def _retain_best_candidates(
     rows: Iterable[MonetRow], *, source: str, limit: int
 ) -> list[MonetRow]:
+    candidates = list(rows)
+    seen_keys: set[str] = set()
+    for row in candidates:
+        if row.key in seen_keys:
+            raise ValueError(f"duplicate MONET key: {row.key}")
+        seen_keys.add(row.key)
     return sorted(
-        rows,
+        candidates,
         key=lambda row: (
             hashlib.sha256(f"{SELECTION_SEED}\0{source}\0{row.key}".encode()).digest(),
             row.key,

@@ -3,13 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sys
 import tempfile
+from types import ModuleType, SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from tools.prepare_monet_training import (
+    SOURCE_PATHS,
+    _load_candidates,
     _load_exposed_holdouts,
     _parse_rows,
     _retain_best_candidates,
+    main,
 )
 
 
@@ -75,6 +81,148 @@ class PrepareMonetTrainingTests(unittest.TestCase):
 
         self.assertEqual(forward, reverse)
         self.assertEqual(len(forward), 5)
+
+    def test_bounded_candidates_reject_duplicate_keys_at_cutoff(self) -> None:
+        rows = _parse_rows(
+            [_raw_row(index) for index in range(20)],
+            shard_path="v1.2.0/synthetic/flux-schnell/0-0/000000.parquet",
+            expected_source="synthetic-flux-schnell",
+        )
+        ranked = _retain_best_candidates(
+            rows, source="synthetic-flux-schnell", limit=len(rows)
+        )
+        duplicate = ranked[4]
+        conflicting = type(duplicate)(
+            key=duplicate.key,
+            upstream_path="another-shard.parquet",
+            source=duplicate.source,
+            license=duplicate.license,
+            upstream_sha256=hashlib.sha256(b"different-upstream").hexdigest(),
+            perceptual_hash="ffffffffffffffff",
+            sscd_cluster_id="different-cluster",
+            thumbnail=b"different-image",
+        )
+
+        for candidates in ([*ranked[:5], conflicting], [conflicting, *ranked[:5]]):
+            with self.subTest(conflict_first=candidates[0] is conflicting):
+                with self.assertRaisesRegex(ValueError, "duplicate MONET key"):
+                    _retain_best_candidates(
+                        candidates,
+                        source="synthetic-flux-schnell",
+                        limit=5,
+                    )
+
+    def test_main_validates_holdouts_before_loading_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            calls: list[str] = []
+            arguments = SimpleNamespace(
+                output=root / "output",
+                cache_dir=root / "cache",
+                synthetic_shards=6,
+                real_shards=16,
+                holdout_manifest=[root / "v1.json", root / "v2.json"],
+            )
+
+            def load_holdouts(paths: list[Path]) -> list[object]:
+                self.assertEqual(paths, arguments.holdout_manifest)
+                calls.append("holdouts")
+                return []
+
+            def load_candidates(**kwargs: object) -> None:
+                self.assertEqual(calls, ["holdouts"])
+                raise RuntimeError("stop after ordering assertion")
+
+            with (
+                patch(
+                    "tools.prepare_monet_training._parse_arguments",
+                    return_value=arguments,
+                ),
+                patch(
+                    "tools.prepare_monet_training._capture_provenance",
+                    return_value=("commit", "script"),
+                ),
+                patch(
+                    "tools.prepare_monet_training._load_exposed_holdouts",
+                    side_effect=load_holdouts,
+                ),
+                patch(
+                    "tools.prepare_monet_training._load_candidates",
+                    side_effect=load_candidates,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "stop after ordering assertion"
+                ):
+                    main()
+
+            self.assertEqual(calls, ["holdouts"])
+
+    def test_all_source_shard_counts_are_checked_before_downloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            card = root / "README.md"
+            card.write_text("card", encoding="utf-8")
+            downloads: list[str] = []
+            discoveries: list[str] = []
+
+            hub = ModuleType("huggingface_hub")
+
+            def list_repo_tree(
+                dataset_id: str, *, path_in_repo: str, **kwargs: object
+            ) -> list[SimpleNamespace]:
+                discoveries.append(path_in_repo)
+                if path_in_repo == SOURCE_PATHS["synthetic-z-image"]:
+                    return []
+                return [SimpleNamespace(path=f"{path_in_repo}/000000.parquet")]
+
+            def hf_hub_download(
+                dataset_id: str, filename: str, **kwargs: object
+            ) -> str:
+                downloads.append(filename)
+                return str(card if filename == "README.md" else root / filename)
+
+            hub.list_repo_tree = list_repo_tree  # type: ignore[attr-defined]
+            hub.hf_hub_download = hf_hub_download  # type: ignore[attr-defined]
+
+            parquet = ModuleType("pyarrow.parquet")
+
+            class Table:
+                def __init__(self, path: str) -> None:
+                    self.path = path
+
+                def to_pylist(self) -> list[dict[str, object]]:
+                    source = next(
+                        source
+                        for source, source_path in SOURCE_PATHS.items()
+                        if source_path in self.path
+                    )
+                    row = _raw_row(len(downloads), source=source)
+                    if source == "commoncatalog-cc-by":
+                        row["license"] = "cc-by-4.0"
+                    return [row]
+
+            parquet.read_table = (  # type: ignore[attr-defined]
+                lambda path, *, columns: Table(str(path))
+            )
+            pyarrow = ModuleType("pyarrow")
+            pyarrow.parquet = parquet  # type: ignore[attr-defined]
+
+            with patch.dict(
+                sys.modules,
+                {
+                    "huggingface_hub": hub,
+                    "pyarrow": pyarrow,
+                    "pyarrow.parquet": parquet,
+                },
+            ):
+                with self.assertRaisesRegex(RuntimeError, "not enough parquet shards"):
+                    _load_candidates(
+                        cache_dir=root / "cache", synthetic_shards=1, real_shards=1
+                    )
+
+            self.assertEqual(discoveries, list(SOURCE_PATHS.values()))
+            self.assertEqual(downloads, [])
 
     def test_holdout_loader_requires_exact_registered_digest_set(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
