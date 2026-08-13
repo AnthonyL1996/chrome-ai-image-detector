@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "POIDH Local AI Image Detector (Scaffold)",
+  "version": "0.1.0",
+  "description": "Explicitly scans page images for a future local-only AI confidence model. Inference is not bundled yet.",
+  "minimum_chrome_version": "120",
+  "permissions": [
+    "activeTab",
+    "scripting"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Scan page images locally"
+  },
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}

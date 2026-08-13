@@ -1,0 +1,8 @@
+[data-poidh-scan-status="true"] {
+  block-size: 1px !important;
+  clip-path: inset(50%) !important;
+  inline-size: 1px !important;
+  overflow: hidden !important;
+  position: fixed !important;
+  white-space: nowrap !important;
+}

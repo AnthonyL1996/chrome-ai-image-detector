@@ -1,0 +1,49 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  min-width: 20rem;
+}
+
+main {
+  padding: 1rem;
+}
+
+h1 {
+  font-size: 1.1rem;
+  margin: 0 0 0.75rem;
+}
+
+.notice {
+  line-height: 1.4;
+}
+
+button {
+  background: #3155d9;
+  border: 0;
+  border-radius: 0.4rem;
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 650;
+  padding: 0.7rem 0.9rem;
+  width: 100%;
+}
+
+button:focus-visible {
+  outline: 0.2rem solid #ffbf47;
+  outline-offset: 0.15rem;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+#scan-status {
+  line-height: 1.4;
+  margin-bottom: 0;
+}
