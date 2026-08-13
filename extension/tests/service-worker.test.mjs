@@ -19,7 +19,7 @@ async function loadServiceWorker(overrides = {}) {
       executeScript: async (options) => calls.push(["executeScript", options]),
     },
     tabs: {
-      query: async () => [{ id: 17 }],
+      query: async () => [{ id: 17, url: "https://example.test/page" }],
       sendMessage: async () => ({ ok: true, count: 0, errors: 0, skipped: 0 }),
     },
     permissions: {
@@ -76,7 +76,7 @@ test("image scoring is bound to the top frame of the tab being scanned", async (
       executeScript: async (options) => calls.push(["executeScript", options]),
     },
     tabs: {
-      query: async () => [{ id: 17 }],
+      query: async () => [{ id: 17, url: "https://example.test/page" }],
       sendMessage: async () => {
         const scoring = await dispatch(
           {
@@ -210,7 +210,10 @@ test("scan requests optional access only for the active page origin", async () =
   );
 
   assert.equal(response.ok, true);
-  assert.deepEqual(requested, [{ origins: ["https://example.test:8443/*"] }]);
+  assert.equal(
+    JSON.stringify(requested),
+    JSON.stringify([{ origins: ["https://example.test:8443/*"] }]),
+  );
 });
 
 test("scan stops before script injection when optional origin access is denied", async () => {

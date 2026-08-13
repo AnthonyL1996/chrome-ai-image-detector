@@ -1,7 +1,8 @@
 import { createModelRuntime } from "./runtime/model-runtime.mjs";
+import { loadOnnxBackend } from "./runtime/onnx-backend.mjs";
 
-const runtime = createModelRuntime();
 const activeScanTabs = new Set();
+let runtimePromise;
 
 function requirePopupSender(sender) {
   const expectedUrl = chrome.runtime.getURL("popup.html");
@@ -38,6 +39,7 @@ async function scanActiveTab(sender) {
 
   activeScanTabs.add(tab.id);
   try {
+    await ensureOriginAccess(tab);
     await chrome.scripting.insertCSS({
       target: { tabId: tab.id },
       files: ["content.css"],
@@ -52,13 +54,60 @@ async function scanActiveTab(sender) {
   }
 }
 
+async function ensureOriginAccess(tab) {
+  if (
+    !chrome.permissions ||
+    typeof chrome.permissions.contains !== "function" ||
+    typeof chrome.permissions.request !== "function"
+  ) {
+    return;
+  }
+  const url = new URL(typeof tab.url === "string" ? tab.url : "");
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("The active page has no requestable web origin.");
+  }
+  const origin = `${url.origin}/*`;
+  const details = { origins: [origin] };
+  if (await chrome.permissions.contains(details)) {
+    return;
+  }
+  if (!(await chrome.permissions.request(details))) {
+    throw new Error(`Optional access to ${url.origin} was denied.`);
+  }
+}
+
+async function loadRuntime() {
+  try {
+    const ort = globalThis.POIDH_ORT;
+    if (!ort) {
+      return createModelRuntime();
+    }
+    const backend = await loadOnnxBackend({
+      ort,
+      modelUrl: chrome.runtime.getURL("model/detector.onnx"),
+      metadataUrl: chrome.runtime.getURL("model/metadata.json"),
+    });
+    return createModelRuntime({ backend });
+  } catch (_error) {
+    // The unpacked developer build remains usable before model files are installed.
+    return createModelRuntime();
+  }
+}
+
+function getRuntime() {
+  if (runtimePromise === undefined) {
+    runtimePromise = loadRuntime();
+  }
+  return runtimePromise;
+}
+
 async function routeMessage(message, sender) {
   switch (message?.type) {
     case "SCAN_ACTIVE_TAB":
       return scanActiveTab(sender);
     case "SCORE_IMAGES": {
       requireScoringSender(sender);
-      const results = await runtime.scoreImages(message.images);
+      const results = await (await getRuntime()).scoreImages(message.images);
       return { ok: true, results };
     }
     default:

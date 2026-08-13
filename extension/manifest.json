@@ -8,6 +8,10 @@
     "activeTab",
     "scripting"
   ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "Scan page images locally"
