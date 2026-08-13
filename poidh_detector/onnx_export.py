@@ -148,8 +148,8 @@ def export_detector_onnx(
         try:
             if publication_descriptor is None:
                 _cleanup_staging(staging_descriptor)
-            os.fsync(parent_descriptor)
-            if publication_descriptor is not None:
+                os.fsync(parent_descriptor)
+            else:
                 _require_published_identity_or_hide(
                     destination,
                     parent_descriptor,
@@ -419,6 +419,12 @@ def _publish_bundle(
             )
             ready_temporary = None
             os.fsync(staging_descriptor)
+            _verify_staged_bundle(
+                staging_descriptor,
+                model_descriptor,
+                metadata_descriptor,
+                metadata,
+            )
             os.fsync(parent_descriptor)
             _require_directory_identity(destination, staging_descriptor)
             publication_descriptor = os.dup(staging_descriptor)

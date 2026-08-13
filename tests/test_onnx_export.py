@@ -783,34 +783,33 @@ class OnnxExporterTests(unittest.TestCase):
             )
             self.assertFalse((displaced / "READY").exists())
 
-    def test_publication_fails_if_destination_is_replaced_during_staging_cleanup(
-        self,
-    ) -> None:
+    def test_publication_fails_if_destination_is_replaced_after_publish(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self._inputs(Path(temporary))
             destination = paths["output"].absolute()
             displaced = destination.with_name("displaced-export")
             foreign_file = destination / "foreign.txt"
-            real_fsync = os.fsync
-            published_parent_syncs = 0
+            real_identity_check = onnx_export._require_published_identity_or_hide
 
-            def replace_during_staging_cleanup(descriptor: int) -> None:
-                nonlocal published_parent_syncs
-                real_fsync(descriptor)
-                if destination.exists():
-                    parent_stat = os.stat(destination.parent)
-                    descriptor_stat = os.fstat(descriptor)
-                    if (parent_stat.st_dev, parent_stat.st_ino) == (
-                        descriptor_stat.st_dev,
-                        descriptor_stat.st_ino,
-                    ):
-                        published_parent_syncs += 1
-                    if published_parent_syncs == 2:
-                        destination.rename(displaced)
-                        destination.mkdir()
-                        foreign_file.write_text("foreign", encoding="ascii")
+            def replace_before_identity_check(
+                checked_destination: Path,
+                parent_descriptor: int,
+                publication_descriptor: int,
+            ) -> None:
+                destination.rename(displaced)
+                destination.mkdir()
+                foreign_file.write_text("foreign", encoding="ascii")
+                real_identity_check(
+                    checked_destination,
+                    parent_descriptor,
+                    publication_descriptor,
+                )
 
-            with patch.object(os, "fsync", replace_during_staging_cleanup):
+            with patch.object(
+                onnx_export,
+                "_require_published_identity_or_hide",
+                replace_before_identity_check,
+            ):
                 with self.assertRaisesRegex(RuntimeError, "identity"):
                     export_detector_onnx(
                         **paths,
