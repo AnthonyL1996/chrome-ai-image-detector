@@ -267,7 +267,9 @@ class OnnxExporterTests(unittest.TestCase):
                 **paths,
                 torch_module=torch,
                 timm_module=timm,
-                import_module=_missing_onnx,
+                import_module=lambda name: _FakeOnnx()
+                if name == "onnx"
+                else _missing_onnx(name),
             )
 
             self.assertEqual(
@@ -430,7 +432,9 @@ class OnnxExporterTests(unittest.TestCase):
                     **external_paths,
                     torch_module=_FakeTorch(create_external_data=True),
                     timm_module=_FakeTimm(_FakeDetector()),
-                    import_module=_missing_onnx,
+                    import_module=lambda name: _FakeOnnx()
+                    if name == "onnx"
+                    else _missing_onnx(name),
                 )
             self.assertFalse(external_paths["output"].exists())
 

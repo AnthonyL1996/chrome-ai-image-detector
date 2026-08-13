@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 import hashlib
 import importlib
+import io
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import tempfile
 from typing import Any
@@ -28,6 +30,7 @@ from poidh_detector.training import TrainingConfig
 
 _MODEL_NAME = "detector.onnx"
 _METADATA_NAME = "metadata.json"
+_READY_NAME = "READY"
 _INPUT_SHAPE = (1, 3, 224, 224)
 _OUTPUT_SHAPE = (1, 1)
 
@@ -67,28 +70,20 @@ def export_detector_onnx(
     if calibration.checkpoint_sha256 != checkpoint_sha256:
         raise ValueError("calibrator checkpoint digest mismatch")
 
-    metadata = ExportMetadata(
-        checkpoint_sha256=checkpoint_sha256,
-        calibrator_sha256=_sha256(calibrator_payload),
-        config_sha256=_sha256(config_payload),
-        code_sha256=_sha256(code_payload),
-        dataset_manifest_sha256=dataset_manifest_sha256,
-        license_policy_sha256=_sha256(license_payload),
-    )
-
+    onnx = _required_module("onnx", import_module)
     torch = torch_module or _required_module("torch", import_module)
     model = create_convnextv2_nano(
         ConvNeXtV2NanoConfig(),
         timm_module=timm_module,
         import_module=import_module,
     )
-    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    state = torch.load(
+        io.BytesIO(checkpoint_payload), map_location="cpu", weights_only=True
+    )
     if not isinstance(state, Mapping) or not state:
         raise ValueError("checkpoint must contain a non-empty model state mapping")
     if any(not isinstance(name, str) or not name for name in state):
         raise ValueError("checkpoint state keys must be non-empty strings")
-    if _read_regular_file(checkpoint, "checkpoint") != checkpoint_payload:
-        raise RuntimeError("checkpoint changed during ONNX export")
     model.load_state_dict(state, strict=True)
     model.eval()
     model.requires_grad_(False)
@@ -105,8 +100,8 @@ def export_detector_onnx(
             export_model,
             dummy_input,
             model_path,
-            input_names=[metadata.input_name],
-            output_names=[metadata.output_name],
+            input_names=["image"],
+            output_names=["probability_ai"],
             opset_version=ONNX_OPSET_VERSION,
             external_data=False,
             dynamic_axes=None,
@@ -116,14 +111,48 @@ def export_detector_onnx(
             dynamo=False,
         )
         _require_single_model_file(staging, model_path)
-        _validate_if_onnx_available(model_path, metadata, import_module)
-        (staging / _METADATA_NAME).write_bytes(metadata.to_json_bytes())
-        if os.path.lexists(destination):
-            raise FileExistsError(f"ONNX export output already exists: {destination}")
-        os.rename(staging, destination)
+        metadata = ExportMetadata(
+            checkpoint_sha256=checkpoint_sha256,
+            calibrator_sha256=_sha256(calibrator_payload),
+            config_sha256=_sha256(config_payload),
+            code_sha256=_sha256(code_payload),
+            dataset_manifest_sha256=dataset_manifest_sha256,
+            license_policy_sha256=_sha256(license_payload),
+            model_sha256=_sha256(_read_regular_file(model_path, "ONNX model")),
+        )
+        _validate_onnx(model_path, metadata, onnx)
+        metadata_path = staging / _METADATA_NAME
+        metadata_path.write_bytes(metadata.to_json_bytes())
+        _fsync_file(model_path)
+        _fsync_file(metadata_path)
+        _fsync_directory(staging)
+        _publish_bundle(staging, destination, metadata)
     finally:
         if staging.exists():
             shutil.rmtree(staging)
+            _fsync_directory(destination.parent)
+    return metadata
+
+
+def validate_export_bundle(output: Path) -> ExportMetadata:
+    """Verify canonical metadata and hashes for a published ONNX bundle."""
+
+    bundle = output.absolute()
+    if not bundle.is_dir() or bundle.is_symlink():
+        raise ValueError(f"ONNX export bundle must be a real directory: {bundle}")
+    expected = {_MODEL_NAME, _METADATA_NAME, _READY_NAME}
+    if {entry.name for entry in bundle.iterdir()} != expected:
+        raise ValueError("ONNX export bundle is incomplete or contains extra files")
+
+    model_payload = _read_regular_file(bundle / _MODEL_NAME, "ONNX model")
+    metadata_payload = _read_regular_file(bundle / _METADATA_NAME, "export metadata")
+    ready_payload = _read_regular_file(bundle / _READY_NAME, "READY marker")
+    expected_ready = (_sha256(metadata_payload) + "\n").encode("ascii")
+    if ready_payload != expected_ready:
+        raise ValueError("READY marker digest mismatch")
+    metadata = _load_export_metadata(metadata_payload)
+    if metadata.model_sha256 != _sha256(model_payload):
+        raise ValueError("model digest mismatch")
     return metadata
 
 
@@ -260,17 +289,7 @@ def _load_calibration_metrics(document: object) -> CalibrationMetrics:
     )
 
 
-def _validate_if_onnx_available(
-    model_path: Path,
-    metadata: ExportMetadata,
-    import_module: Callable[[str], Any],
-) -> None:
-    try:
-        onnx = import_module("onnx")
-    except ModuleNotFoundError as error:
-        if error.name != "onnx":
-            raise
-        return
+def _validate_onnx(model_path: Path, metadata: ExportMetadata, onnx: Any) -> None:
     onnx.checker.check_model(str(model_path), full_check=True)
     model = onnx.load(str(model_path), load_external_data=False)
     graph = model.graph
@@ -294,6 +313,75 @@ def _validate_if_onnx_available(
         external_data_files=external,
     )
     validate_onnx_artifact(artifact, metadata)
+
+
+def _load_export_metadata(payload: bytes) -> ExportMetadata:
+    document = _json_object(payload, "export metadata")
+    metadata = ExportMetadata(
+        checkpoint_sha256=document.get("checkpoint_sha256"),
+        calibrator_sha256=document.get("calibrator_sha256"),
+        config_sha256=document.get("config_sha256"),
+        code_sha256=document.get("code_sha256"),
+        dataset_manifest_sha256=document.get("dataset_manifest_sha256"),
+        license_policy_sha256=document.get("license_policy_sha256"),
+        model_sha256=document.get("model_sha256"),
+    )
+    if metadata.to_json_bytes() != payload:
+        raise ValueError("export metadata JSON must be canonical and frozen")
+    return metadata
+
+
+def _publish_bundle(staging: Path, destination: Path, metadata: ExportMetadata) -> None:
+    owns_destination = False
+    ready_temporary: Path | None = None
+    try:
+        try:
+            destination.mkdir(mode=0o700)
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"ONNX export output already exists: {destination}"
+            ) from error
+        owns_destination = True
+
+        reservation_token = secrets.token_hex(32)
+        reservation = destination / ".reservation"
+        reservation.write_text(reservation_token, encoding="ascii")
+        _fsync_file(reservation)
+        _fsync_directory(destination)
+        _fsync_directory(destination.parent)
+
+        (staging / _MODEL_NAME).replace(destination / _MODEL_NAME)
+        (staging / _METADATA_NAME).replace(destination / _METADATA_NAME)
+        _fsync_directory(destination)
+
+        ready_payload = (_sha256(metadata.to_json_bytes()) + "\n").encode("ascii")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{_READY_NAME}.", suffix=".tmp", dir=destination
+        )
+        ready_temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(ready_payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        reservation.unlink()
+        owns_destination = False
+        os.replace(ready_temporary, destination / _READY_NAME)
+        ready_temporary = None
+        _fsync_directory(destination)
+        _fsync_directory(destination.parent)
+    finally:
+        if ready_temporary is not None and os.path.lexists(ready_temporary):
+            ready_temporary.unlink()
+        if owns_destination and not os.path.lexists(destination / _READY_NAME):
+            reservation = destination / ".reservation"
+            try:
+                owned = reservation.read_text(encoding="ascii") == reservation_token
+            except (NameError, OSError):
+                owned = not any(destination.iterdir())
+            if owned:
+                shutil.rmtree(destination)
+                _fsync_directory(destination.parent)
 
 
 def _onnx_tensor(value: Any, onnx: Any) -> OnnxTensor:
@@ -334,6 +422,22 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _fsync_file(path: Path) -> None:
+    with path.open("r+b") as stream:
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _fsync_directory(path: Path, *, os_name: str | None = None) -> None:
+    if (os_name or os.name) == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _required_module(name: str, import_module: Callable[[str], Any]) -> Any:
     try:
         return import_module(name)
@@ -341,5 +445,5 @@ def _required_module(name: str, import_module: Callable[[str], Any]) -> Any:
         if error.name != name:
             raise
         raise RuntimeError(
-            "ONNX export requires torch and timm from the training environment"
+            f"ONNX export requires {name}; install the training extras"
         ) from error
