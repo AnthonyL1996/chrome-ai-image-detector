@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import ctypes
+import errno
 import hashlib
 import importlib
 import io
@@ -9,6 +11,7 @@ import os
 from pathlib import Path
 import secrets
 import stat
+import sys
 import tempfile
 from typing import Any
 
@@ -92,10 +95,15 @@ def export_detector_onnx(
     export_model = _calibrated_model(model, calibration, torch)
     dummy_input = torch.zeros(_INPUT_SHAPE, dtype=torch.float32)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(
-        tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
-    )
-    staging_descriptor = _open_directory(staging)
+    parent_descriptor = _open_directory(destination.parent)
+    try:
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
+        )
+        staging_descriptor = _open_directory(staging)
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
     publication_descriptor: int | None = None
     try:
         model_path = staging / _MODEL_NAME
@@ -129,15 +137,27 @@ def export_detector_onnx(
         _fsync_file(model_path)
         _fsync_file(metadata_path)
         _fsync_directory(staging)
-        publication_descriptor = _publish_bundle(staging, destination, metadata)
+        publication_descriptor = _publish_bundle(
+            staging,
+            staging_descriptor,
+            destination,
+            parent_descriptor,
+            metadata,
+        )
     finally:
         try:
-            _cleanup_staging(staging, staging_descriptor)
-            _fsync_directory(destination.parent)
+            if publication_descriptor is None:
+                _cleanup_staging(staging_descriptor)
+            os.fsync(parent_descriptor)
             if publication_descriptor is not None:
-                _require_directory_identity(destination, publication_descriptor)
+                _require_published_identity_or_hide(
+                    destination,
+                    parent_descriptor,
+                    publication_descriptor,
+                )
         finally:
             os.close(staging_descriptor)
+            os.close(parent_descriptor)
             if publication_descriptor is not None:
                 os.close(publication_descriptor)
     return metadata
@@ -340,63 +360,89 @@ def _load_export_metadata(payload: bytes) -> ExportMetadata:
     return metadata
 
 
-def _publish_bundle(staging: Path, destination: Path, metadata: ExportMetadata) -> int:
+def _publish_bundle(
+    staging: Path,
+    staging_descriptor: int,
+    destination: Path,
+    parent_descriptor: int,
+    metadata: ExportMetadata,
+) -> int:
     _require_secure_directory_operations()
-    try:
-        destination.mkdir(mode=0o700)
-    except FileExistsError as error:
-        raise FileExistsError(
-            f"ONNX export output already exists: {destination}"
-        ) from error
-
-    directory_descriptor = _open_directory(destination)
+    _require_directory_identity(staging, staging_descriptor)
+    model_descriptor = _open_regular_file_at(staging_descriptor, _MODEL_NAME)
+    metadata_descriptor: int | None = None
     ready_temporary: str | None = None
     published = False
     try:
-        _require_directory_identity(destination, directory_descriptor)
+        metadata_descriptor = _open_regular_file_at(staging_descriptor, _METADATA_NAME)
         reservation_token = secrets.token_hex(32)
-        _require_directory_identity(destination, directory_descriptor)
-        _write_file_at(
-            directory_descriptor,
-            ".reservation",
-            reservation_token.encode("ascii"),
+        _verify_staged_bundle(
+            staging_descriptor,
+            model_descriptor,
+            metadata_descriptor,
+            metadata,
         )
-        os.fsync(directory_descriptor)
-        _fsync_directory(destination.parent)
-
-        _require_directory_identity(destination, directory_descriptor)
-        _move_file_at(staging / _MODEL_NAME, directory_descriptor, _MODEL_NAME)
-        _move_file_at(staging / _METADATA_NAME, directory_descriptor, _METADATA_NAME)
-        os.fsync(directory_descriptor)
-
-        ready_payload = (_sha256(metadata.to_json_bytes()) + "\n").encode("ascii")
-        ready_temporary = f".{_READY_NAME}.{reservation_token}.tmp"
-        _write_file_at(directory_descriptor, ready_temporary, ready_payload)
-
-        _require_directory_identity(destination, directory_descriptor)
-        os.unlink(".reservation", dir_fd=directory_descriptor)
-        os.rename(
-            ready_temporary,
-            _READY_NAME,
-            src_dir_fd=directory_descriptor,
-            dst_dir_fd=directory_descriptor,
+        _require_directory_identity(staging, staging_descriptor)
+        _verify_staged_bundle(
+            staging_descriptor,
+            model_descriptor,
+            metadata_descriptor,
+            metadata,
         )
-        ready_temporary = None
-        os.fsync(directory_descriptor)
-        _fsync_directory(destination.parent)
-        _require_directory_identity(destination, directory_descriptor)
+        os.fsync(staging_descriptor)
+
+        _rename_directory_no_replace(
+            parent_descriptor,
+            staging.name,
+            destination.name,
+        )
+        try:
+            _require_entry_identity_at(
+                parent_descriptor,
+                destination.name,
+                staging_descriptor,
+            )
+            _verify_staged_bundle(
+                staging_descriptor,
+                model_descriptor,
+                metadata_descriptor,
+                metadata,
+            )
+            ready_payload = (_sha256(metadata.to_json_bytes()) + "\n").encode("ascii")
+            ready_temporary = f".{_READY_NAME}.{reservation_token}.tmp"
+            _write_file_at(staging_descriptor, ready_temporary, ready_payload)
+            os.rename(
+                ready_temporary,
+                _READY_NAME,
+                src_dir_fd=staging_descriptor,
+                dst_dir_fd=staging_descriptor,
+            )
+            ready_temporary = None
+            os.fsync(staging_descriptor)
+            os.fsync(parent_descriptor)
+            _require_directory_identity(destination, staging_descriptor)
+            publication_descriptor = os.dup(staging_descriptor)
+        except BaseException:
+            _hide_visible_failed_publication(parent_descriptor, destination.name)
+            raise
         published = True
-        return directory_descriptor
+        return publication_descriptor
     finally:
         try:
             if ready_temporary is not None:
                 try:
-                    os.unlink(ready_temporary, dir_fd=directory_descriptor)
+                    os.unlink(ready_temporary, dir_fd=staging_descriptor)
+                except FileNotFoundError:
+                    pass
+            if not published:
+                try:
+                    os.unlink(_READY_NAME, dir_fd=staging_descriptor)
                 except FileNotFoundError:
                     pass
         finally:
-            if not published:
-                os.close(directory_descriptor)
+            os.close(model_descriptor)
+            if metadata_descriptor is not None:
+                os.close(metadata_descriptor)
 
 
 def _require_secure_directory_operations() -> None:
@@ -406,6 +452,10 @@ def _require_secure_directory_operations() -> None:
     ):
         raise RuntimeError(
             "secure ONNX publication requires directory-relative filesystem operations"
+        )
+    if sys.platform not in {"darwin", "linux"}:
+        raise RuntimeError(
+            "secure ONNX publication requires atomic no-replace directory rename"
         )
 
 
@@ -443,17 +493,168 @@ def _write_file_at(directory_descriptor: int, name: str, payload: bytes) -> None
         os.fsync(stream.fileno())
 
 
-def _move_file_at(source: Path, directory_descriptor: int, name: str) -> None:
-    os.rename(source, name, dst_dir_fd=directory_descriptor)
+def _open_regular_file_at(directory_descriptor: int, name: str) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+    try:
+        opened = os.fstat(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    if not stat.S_ISREG(opened.st_mode):
+        os.close(descriptor)
+        raise RuntimeError(f"staged ONNX export file is not regular: {name}")
+    return descriptor
 
 
-def _cleanup_staging(staging: Path, directory_descriptor: int) -> None:
-    _require_directory_identity(staging, directory_descriptor)
+def _read_file_descriptor(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while chunk := os.read(descriptor, 1024 * 1024):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _verify_staged_bundle(
+    staging_descriptor: int,
+    model_descriptor: int,
+    metadata_descriptor: int,
+    metadata: ExportMetadata,
+) -> None:
+    _require_file_identity(staging_descriptor, _MODEL_NAME, model_descriptor)
+    _require_file_identity(staging_descriptor, _METADATA_NAME, metadata_descriptor)
+    if _read_file_descriptor(metadata_descriptor) != metadata.to_json_bytes():
+        raise RuntimeError("staged ONNX metadata changed before publication")
+    if _sha256(_read_file_descriptor(model_descriptor)) != metadata.model_sha256:
+        raise RuntimeError("staged ONNX model changed before publication")
+
+
+def _require_file_identity(
+    directory_descriptor: int, name: str, descriptor: int
+) -> None:
+    visible = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(visible.st_mode)
+        or visible.st_dev != opened.st_dev
+        or visible.st_ino != opened.st_ino
+    ):
+        raise RuntimeError(f"staged ONNX file identity changed: {name}")
+
+
+def _require_entry_identity_at(
+    parent_descriptor: int,
+    name: str,
+    descriptor: int,
+) -> None:
+    visible = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(visible.st_mode)
+        or visible.st_dev != opened.st_dev
+        or visible.st_ino != opened.st_ino
+    ):
+        raise RuntimeError("ONNX export destination identity changed")
+
+
+def _hide_failed_publication(parent_descriptor: int, name: str) -> None:
+    quarantine = f".{name}.failed.{secrets.token_hex(32)}"
+    _atomic_rename_no_replace(parent_descriptor, name, quarantine)
+
+
+def _hide_visible_failed_publication(parent_descriptor: int, name: str) -> None:
+    try:
+        os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    _hide_failed_publication(parent_descriptor, name)
+
+
+def _require_published_identity_or_hide(
+    destination: Path,
+    parent_descriptor: int,
+    publication_descriptor: int,
+) -> None:
+    try:
+        _require_directory_identity(destination, publication_descriptor)
+    except BaseException:
+        _hide_visible_failed_publication(parent_descriptor, destination.name)
+        raise
+
+
+def _rename_directory_no_replace(
+    parent_descriptor: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    _atomic_rename_no_replace(parent_descriptor, source_name, destination_name)
+
+
+def _atomic_rename_no_replace(
+    parent_descriptor: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    encoded_source = os.fsencode(source_name)
+    encoded_destination = os.fsencode(destination_name)
+    if sys.platform == "darwin":
+        rename = library.renameatx_np
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(
+            parent_descriptor,
+            encoded_source,
+            parent_descriptor,
+            encoded_destination,
+            0x00000004,
+        )
+    elif sys.platform == "linux":
+        try:
+            rename = library.renameat2
+        except AttributeError as error:
+            raise RuntimeError("secure ONNX publication requires renameat2") from error
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(
+            parent_descriptor,
+            encoded_source,
+            parent_descriptor,
+            encoded_destination,
+            0x00000001,
+        )
+    else:
+        raise RuntimeError(
+            "secure ONNX publication requires atomic no-replace directory rename"
+        )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            f"ONNX export output already exists: {destination_name}",
+        )
+    raise OSError(error_number, os.strerror(error_number), destination_name)
+
+
+def _cleanup_staging(directory_descriptor: int) -> None:
     for name in os.listdir(directory_descriptor):
         entry = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
         if stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
             os.unlink(name, dir_fd=directory_descriptor)
-    _require_directory_identity(staging, directory_descriptor)
 
 
 def _onnx_tensor(value: Any, onnx: Any) -> OnnxTensor:

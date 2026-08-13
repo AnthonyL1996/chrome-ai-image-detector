@@ -29,6 +29,13 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _quarantined_export(destination: Path) -> Path:
+    matches = list(destination.parent.glob(f".{destination.name}.failed.*"))
+    if len(matches) != 1:
+        raise AssertionError(f"expected one quarantined export, found {matches}")
+    return matches[0]
+
+
 def _config(dataset_manifest: bytes) -> TrainingConfig:
     return TrainingConfig(
         dataset_manifest_sha256=_sha256(dataset_manifest),
@@ -652,7 +659,13 @@ class OnnxExporterTests(unittest.TestCase):
                         else _missing_onnx(name),
                     )
 
-            self.assertEqual(foreign_file.read_text(encoding="ascii"), "foreign")
+            self.assertFalse(destination.exists())
+            self.assertEqual(
+                (_quarantined_export(destination) / "foreign.txt").read_text(
+                    encoding="ascii"
+                ),
+                "foreign",
+            )
             self.assertTrue(displaced.is_dir())
 
     def test_publication_fails_if_destination_is_replaced_during_final_parent_fsync(
@@ -692,7 +705,13 @@ class OnnxExporterTests(unittest.TestCase):
                         else _missing_onnx(name),
                     )
 
-            self.assertEqual(foreign_file.read_text(encoding="ascii"), "foreign")
+            self.assertFalse(destination.exists())
+            self.assertEqual(
+                (_quarantined_export(destination) / "foreign.txt").read_text(
+                    encoding="ascii"
+                ),
+                "foreign",
+            )
             self.assertFalse((displaced / "READY").exists())
 
     def test_publication_fails_if_destination_is_replaced_during_staging_cleanup(
@@ -733,7 +752,13 @@ class OnnxExporterTests(unittest.TestCase):
                         else _missing_onnx(name),
                     )
 
-            self.assertEqual(foreign_file.read_text(encoding="ascii"), "foreign")
+            self.assertFalse(destination.exists())
+            self.assertEqual(
+                (_quarantined_export(destination) / "foreign.txt").read_text(
+                    encoding="ascii"
+                ),
+                "foreign",
+            )
             self.assertTrue((displaced / "READY").is_file())
 
     def test_staging_cleanup_does_not_delete_a_replacement_directory(self) -> None:
@@ -834,7 +859,6 @@ class OnnxExporterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             paths = self._inputs(Path(temporary))
             destination = paths["output"].absolute()
-            foreign_model = destination / "detector.onnx"
             displaced_staging: Path | None = None
             real_rename = onnx_export._rename_directory_no_replace
 
@@ -870,8 +894,16 @@ class OnnxExporterTests(unittest.TestCase):
                     )
 
             assert displaced_staging is not None
-            self.assertEqual(foreign_model.read_bytes(), b"foreign-model")
-            self.assertFalse((destination / "READY").exists())
+            self.assertFalse(destination.exists())
+            quarantine = _quarantined_export(destination)
+            self.assertEqual(
+                (quarantine / "detector.onnx").read_bytes(),
+                b"foreign-model",
+            )
+            self.assertEqual(
+                (quarantine / "READY").read_bytes(),
+                b"foreign-ready",
+            )
             self.assertTrue(displaced_staging.is_dir())
 
     def test_publication_hides_symlink_source_replaced_at_atomic_rename(self) -> None:
@@ -955,6 +987,20 @@ class OnnxExporterTests(unittest.TestCase):
             with patch.object(os, "fsync") as fsync:
                 onnx_export._fsync_directory(Path(temporary), os_name="nt")
             fsync.assert_not_called()
+
+    def test_descriptor_helpers_close_invalid_staged_files_and_ignore_absence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "detector.onnx").mkdir()
+            descriptor = os.open(root, os.O_RDONLY)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "not regular"):
+                    onnx_export._open_regular_file_at(descriptor, "detector.onnx")
+                onnx_export._hide_visible_failed_publication(descriptor, "absent")
+            finally:
+                os.close(descriptor)
 
     def test_training_extra_declares_real_export_dependencies(self) -> None:
         document = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
