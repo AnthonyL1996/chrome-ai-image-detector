@@ -164,8 +164,8 @@ TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --cpus-per-task="${
 The script rejects a pre-existing fresh-run path. Resume requires an existing,
 non-symlink directory whose canonical path remains below the canonical run
 root, plus a matching training provenance contract.
-For a run created with the 30-epoch override above, resume with the same
-override exported:
+For a run created with the fixed-threshold selection command above, resume with
+the same 30-epoch and selection-metric exports:
 
 ```bash
 POIDH_EPOCHS=30
