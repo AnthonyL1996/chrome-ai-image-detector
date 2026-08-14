@@ -169,7 +169,8 @@ override exported:
 
 ```bash
 POIDH_EPOCHS=30
-TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --cpus-per-task="${POIDH_WORKERS}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=POIDH_WORKERS="${POIDH_WORKERS}",POIDH_EPOCHS="${POIDH_EPOCHS}" hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${POIDH_PYTHON_DEPS}" "${TRAIN_PROFILE}" 1 "${POIDH_RUN_NAME}")"
+POIDH_SELECTION_METRIC=validation_balanced_accuracy
+TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --cpus-per-task="${POIDH_WORKERS}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=POIDH_WORKERS="${POIDH_WORKERS}",POIDH_EPOCHS="${POIDH_EPOCHS}",POIDH_SELECTION_METRIC="${POIDH_SELECTION_METRIC}" hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${POIDH_PYTHON_DEPS}" "${TRAIN_PROFILE}" 1 "${POIDH_RUN_NAME}")"
 ```
 
 ## Monitor and inspect

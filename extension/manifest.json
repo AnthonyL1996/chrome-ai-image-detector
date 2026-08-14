@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "POIDH Local AI Image Detector",
   "version": "0.1.0",
-  "description": "Explicitly scans page images and scores them with a bundled local-only AI detector.",
+  "description": "Scan page images locally with a bundled ONNX model; no server or cloud inference.",
   "minimum_chrome_version": "120",
   "permissions": [
     "activeTab",

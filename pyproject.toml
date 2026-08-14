@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "poidh-ai-detector"
 version = "0.0.0"
-description = "Work-in-progress local AI-image detector for POIDH bounty 323"
+description = "Local-only Chrome image detector with a reproducible H100 training path"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
