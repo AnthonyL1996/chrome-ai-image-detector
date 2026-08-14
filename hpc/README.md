@@ -125,6 +125,18 @@ also accepts `TRAIN_PROFILE` from the environment.
 Set `POIDH_WORKERS` explicitly for reproducibility: wICE may round a CPU request
 to whole physical cores, while the worker count is part of the optimization
 configuration hash. The pilot contract uses four workers.
+For a controlled longer experiment on the same pilot subset, set
+`POIDH_EPOCHS` (for example, `POIDH_EPOCHS=30`) and export it explicitly in
+the `sbatch` command. For example:
+
+```bash
+POIDH_EPOCHS=30
+TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --cpus-per-task="${POIDH_WORKERS}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=POIDH_WORKERS="${POIDH_WORKERS}",POIDH_EPOCHS="${POIDH_EPOCHS}" hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${POIDH_PYTHON_DEPS}" "${TRAIN_PROFILE}" 0)"
+```
+
+This creates a fresh run with a distinct optimization configuration. Repeat
+the same `POIDH_EPOCHS` export if resuming that run; changing it invalidates
+the resume provenance contract.
 Each fresh job writes to
 `${POIDH_RUN_ROOT}/${TRAIN_PROFILE}-${SLURM_JOB_ID}`. To resume a
 transactionally published run after a walltime stop, reuse its one-component
@@ -141,6 +153,13 @@ TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --cpus-per-task="${
 The script rejects a pre-existing fresh-run path. Resume requires an existing,
 non-symlink directory whose canonical path remains below the canonical run
 root, plus a matching training provenance contract.
+For a run created with the 30-epoch override above, resume with the same
+override exported:
+
+```bash
+POIDH_EPOCHS=30
+TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --cpus-per-task="${POIDH_WORKERS}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=POIDH_WORKERS="${POIDH_WORKERS}",POIDH_EPOCHS="${POIDH_EPOCHS}" hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${POIDH_PYTHON_DEPS}" "${TRAIN_PROFILE}" 1 "${POIDH_RUN_NAME}")"
+```
 
 ## Monitor and inspect
 

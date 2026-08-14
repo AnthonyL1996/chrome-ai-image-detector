@@ -58,6 +58,7 @@ def _run_training_script(
     resume: bool,
     dependency_mode: str = "valid",
     worker_count: str | None = None,
+    epoch_count: str | None = None,
     script_path: Path = TRAIN_PATH,
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
     root = Path(temporary)
@@ -109,10 +110,13 @@ def _run_training_script(
         "TRAIN_RESUME",
         "VSC_SCRATCH",
         "POIDH_WORKERS",
+        "POIDH_EPOCHS",
     ):
         environment.pop(variable, None)
     if worker_count is not None:
         environment["POIDH_WORKERS"] = worker_count
+    if epoch_count is not None:
+        environment["POIDH_EPOCHS"] = epoch_count
     if script_path == SMOKE_PATH:
         command = [
             "bash",
@@ -213,6 +217,8 @@ class HpcScriptContracts(unittest.TestCase):
         self.assertIn("--seed 323", script)
         self.assertIn('TRAIN_WORKERS="${POIDH_WORKERS:-${SLURM_CPUS_PER_TASK:-8}}"', script)
         self.assertIn('--workers "${TRAIN_WORKERS}"', script)
+        self.assertIn('TRAIN_EPOCHS="${POIDH_EPOCHS:-}"', script)
+        self.assertIn('--epochs "${TRAIN_EPOCHS}"', script)
 
     def test_training_worker_count_can_be_pinned_independently_of_slurm_rounding(
         self,
@@ -234,6 +240,28 @@ class HpcScriptContracts(unittest.TestCase):
                 run_name="invalid-workers",
                 resume=False,
                 worker_count="0",
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(invocation_log.exists())
+
+    def test_training_epoch_count_can_be_overridden_for_a_fresh_experiment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            completed, invocation_log, _, _ = _run_training_script(
+                temporary,
+                run_name="extended-pilot",
+                resume=False,
+                epoch_count="30",
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            arguments = invocation_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(arguments[arguments.index("--epochs") + 1], "30")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            completed, invocation_log, _, _ = _run_training_script(
+                temporary,
+                run_name="invalid-epochs",
+                resume=False,
+                epoch_count="0",
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertFalse(invocation_log.exists())
@@ -348,6 +376,7 @@ class HpcScriptContracts(unittest.TestCase):
                 self.assertIn(command, readme)
         self.assertNotIn("--export=ALL", readme)
         self.assertIn('--export=POIDH_WORKERS="${POIDH_WORKERS}"', readme)
+        self.assertIn('--export=POIDH_WORKERS="${POIDH_WORKERS}",POIDH_EPOCHS="${POIDH_EPOCHS}"', readme)
         self.assertIn('"${POIDH_PYTHON_DEPS}"', readme)
 
     def test_compute_jobs_never_install_or_download_packages(self) -> None:
