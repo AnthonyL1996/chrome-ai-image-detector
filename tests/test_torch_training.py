@@ -13,6 +13,7 @@ from poidh_detector.torch_training import (
     OptimizationConfig,
     ResumeContract,
     ValidationMetrics,
+    balanced_accuracy_at_threshold,
     binary_auc,
     candidate_from_validation,
     cosine_warmup_multiplier,
@@ -94,6 +95,40 @@ class MetricAndSelectionTests(unittest.TestCase):
         )
         self.assertEqual(candidate.validation_bce, 0.4)
         self.assertEqual(candidate.training_bce, 0.01)
+
+    def test_balanced_accuracy_uses_the_fixed_threshold(self) -> None:
+        self.assertAlmostEqual(
+            balanced_accuracy_at_threshold(
+                [0, 0, 1, 1], [0.2, 0.7, 0.65, 0.9]
+            ),
+            0.75,
+        )
+        with self.assertRaisesRegex(ValueError, "both classes"):
+            balanced_accuracy_at_threshold([0, 0], [0.1, 0.2])
+
+    def test_legacy_history_without_balanced_accuracy_remains_loadable(self) -> None:
+        payload = torch_training._canonical_json(
+            {
+                "candidates": [{
+                    "checkpoint_id": "epoch-0001",
+                    "epoch": 1,
+                    "global_step": 10,
+                    "training_bce": 0.3,
+                    "validation_bce": 0.4,
+                }],
+                "schema_version": 1,
+            }
+        )
+
+        parsed = torch_training._parse_candidate_history(payload)
+
+        self.assertIsNone(parsed[0].validation_balanced_accuracy)
+        self.assertEqual(
+            torch_training._candidate_history_bytes(
+                parsed, include_balanced_accuracy=False
+            ),
+            payload,
+        )
 
 
 class ResumeTests(unittest.TestCase):

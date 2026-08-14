@@ -238,6 +238,7 @@ def _load_training_config(payload: bytes) -> TrainingConfig:
         calibration_split_sha256=document["calibration_split_sha256"],
         exposed_holdout_sha256=tuple(holdouts),
         seed=document["seed"],
+        selection_metric=document["selection_metric"],
     )
     if config.to_json_bytes() != payload:
         raise ValueError("training config JSON must be canonical and frozen")

@@ -70,6 +70,38 @@ class CheckpointPublicationTests(unittest.TestCase):
                 hashlib.sha256(manifest_payload).hexdigest() + "\n",
             )
 
+    def test_manifest_records_balanced_accuracy_selection_value(self) -> None:
+        config = TrainingConfig(
+            dataset_manifest_sha256=_digest("dataset"),
+            split_manifest_sha256=_digest("splits"),
+            calibration_split_sha256=_digest("calibration"),
+            exposed_holdout_sha256=(_digest("v1"), _digest("v2")),
+            seed=323,
+            selection_metric="validation_balanced_accuracy",
+        )
+        candidate = CheckpointCandidate(
+            "epoch-2",
+            2,
+            200,
+            0.2,
+            training_bce=0.1,
+            validation_balanced_accuracy=0.81,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = publish_checkpoint(
+                Path(temporary, "checkpoint"),
+                weights=b"weights",
+                config=config,
+                candidate=candidate,
+                dataset_manifest_sha256=config.dataset_manifest_sha256,
+                split_manifest_sha256=config.split_manifest_sha256,
+                exposed_holdout_sha256=config.exposed_holdout_sha256,
+                repository=Path(temporary),
+                provenance_reader=lambda _: GitProvenance("a" * 40),
+            )
+        self.assertEqual(manifest.selection_metric, "validation_balanced_accuracy")
+        self.assertEqual(manifest.selection_value, 0.81)
+
     def test_refuses_mismatched_input_digests_before_publication(self) -> None:
         config = _config()
         candidate = CheckpointCandidate("epoch-1", 1, 10, 0.3)

@@ -12,7 +12,11 @@ import shutil
 import subprocess
 import tempfile
 
-from poidh_detector.training import CheckpointCandidate, TrainingConfig
+from poidh_detector.training import (
+    CheckpointCandidate,
+    TrainingConfig,
+    checkpoint_selection_value,
+)
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -104,7 +108,9 @@ def publish_checkpoint(
         epoch=candidate.epoch,
         global_step=candidate.global_step,
         selection_metric=config.selection_metric,
-        selection_value=candidate.validation_bce,
+        selection_value=checkpoint_selection_value(
+            candidate, config.selection_metric
+        ),
         weights_file="model.bin",
         weights_format="opaque_binary",
         weights_sha256=hashlib.sha256(weights).hexdigest(),

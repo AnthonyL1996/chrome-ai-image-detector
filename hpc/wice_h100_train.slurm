@@ -36,6 +36,7 @@ TRAIN_PROFILE="${TRAIN_PROFILE:-pilot}"
 TRAIN_RESUME="${TRAIN_RESUME:-0}"
 TRAIN_WORKERS="${POIDH_WORKERS:-${SLURM_CPUS_PER_TASK:-8}}"
 TRAIN_EPOCHS="${POIDH_EPOCHS:-}"
+TRAIN_SELECTION_METRIC="${POIDH_SELECTION_METRIC:-validation_bce}"
 
 canonical_directory() {
     local requested=$1
@@ -88,6 +89,10 @@ if [[ -n "${TRAIN_EPOCHS}" ]] && ! [[ "${TRAIN_EPOCHS}" =~ ^[1-9][0-9]*$ ]]; the
     echo "POIDH_EPOCHS must be a positive integer when set" >&2
     exit 2
 fi
+case "${TRAIN_SELECTION_METRIC}" in
+    validation_bce|validation_balanced_accuracy) ;;
+    *) echo "POIDH_SELECTION_METRIC must be validation_bce or validation_balanced_accuracy" >&2; exit 2 ;;
+esac
 
 SUBMIT_DIRECTORY=${SLURM_SUBMIT_DIR:?"SLURM_SUBMIT_DIR must be set"}
 if [[ ! -f "${SUBMIT_DIRECTORY}/tools/train_detector.py" ]]; then
@@ -107,6 +112,7 @@ EPOCH_ARGUMENTS=()
 if [[ -n "${TRAIN_EPOCHS}" ]]; then
     EPOCH_ARGUMENTS+=(--epochs "${TRAIN_EPOCHS}")
 fi
+SELECTION_ARGUMENTS=(--selection-metric "${TRAIN_SELECTION_METRIC}")
 if [[ "${TRAIN_RESUME}" == "1" ]]; then
     if [[ -L "${CANDIDATE_RUN_DIRECTORY}" || ! -d "${CANDIDATE_RUN_DIRECTORY}" ]]; then
         echo "resume requires an existing, non-symlink run directory" >&2
@@ -141,5 +147,6 @@ python tools/train_detector.py \
     --profile "${TRAIN_PROFILE}" \
     --seed 323 \
     --workers "${TRAIN_WORKERS}" \
+    "${SELECTION_ARGUMENTS[@]}" \
     "${EPOCH_ARGUMENTS[@]}" \
     "${RESUME_ARGUMENTS[@]}"

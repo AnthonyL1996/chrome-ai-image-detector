@@ -11,16 +11,17 @@ function metadata(overrides = {}) {
     model_format: "onnx",
     model_sha256: MODEL_DIGEST,
     input_name: "image",
-    input_shape: [1, 3, 224, 224],
+    input_shape: [1, 3, 384, 384],
     input_dtype: "float32",
     output_name: "probability_ai",
     output_shape: [1, 1],
     output_dtype: "float32",
     output_semantics: "calibrated_probability_ai",
-    calibration: "platt_embedded",
+    calibration: "sigmoid_embedded_offset_2.29",
     preprocessing: {
-      resize: [224, 224],
-      interpolation: "bicubic",
+      resize_shorter_side: 440,
+      center_crop: [384, 384],
+      interpolation: "canvas_2d_high",
       channel_order: "RGB",
       layout: "NCHW",
       input_dtype: "uint8",
@@ -92,7 +93,7 @@ function dependencies({ session, imageTensor } = {}) {
     ort,
     fetchImpl,
     cryptoImpl,
-    imageTensor: imageTensor || (() => new Float32Array(3 * 224 * 224)),
+    imageTensor: imageTensor || (() => new Float32Array(3 * 384 * 384)),
     seen,
   };
 }
@@ -120,7 +121,7 @@ test("loads a hash-checked local ONNX backend and scores images", async () => {
     [{ id: "one", status: "ok", confidence: 0.75 }],
   );
   assert.equal(deps.seen.length, 1);
-  assert.deepEqual(deps.seen[0].image.dims, [1, 3, 224, 224]);
+  assert.deepEqual(deps.seen[0].image.dims, [1, 3, 384, 384]);
 });
 
 test("returns a terminal per-image error when image tensor preparation fails", async () => {
@@ -138,6 +139,40 @@ test("returns a terminal per-image error when image tensor preparation fails", a
     await backend.scoreImages([{ id: "bad", source: "https://example.test/bad.png", alt: "" }]),
     [{ id: "bad", status: "error", code: "IMAGE_DECODE_FAILED", message: "decode" }],
   );
+});
+
+test("bounds stalled image loads and aborts their request", async () => {
+  const deps = dependencies();
+  const modelFetch = deps.fetchImpl;
+  let aborted = false;
+  deps.fetchImpl = async (url, options) => {
+    if (url === "https://example.test/stalled.png") {
+      options.signal.addEventListener("abort", () => { aborted = true; }, { once: true });
+      return new Promise(() => {});
+    }
+    return modelFetch(url, options);
+  };
+  const backend = await loadOnnxBackend({
+    ort: deps.ort,
+    modelUrl: "detector.onnx",
+    metadataUrl: "metadata.json",
+    fetchImpl: deps.fetchImpl,
+    cryptoImpl: deps.cryptoImpl,
+    imageLoadTimeoutMs: 5,
+    imageBitmapFactory: async () => ({ width: 1, height: 1, close() {} }),
+    BlobConstructor: class Blob {},
+  });
+
+  assert.deepEqual(
+    await backend.scoreImages([{ id: "stalled", source: "https://example.test/stalled.png" }]),
+    [{
+      id: "stalled",
+      status: "error",
+      code: "IMAGE_DECODE_FAILED",
+      message: "image decode/load timed out",
+    }],
+  );
+  assert.equal(aborted, true);
 });
 
 test("rejects a model whose digest or session I/O contract is wrong", async () => {
@@ -219,13 +254,15 @@ test("rejects a model output with the wrong type or shape", async () => {
   }
 });
 
-test("matches the antialiased Pillow bicubic preprocessing used for training", async () => {
-  const width = 448;
-  const height = 448;
-  const rgba = new Uint8ClampedArray(width * height * 4);
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const offset = (y * width + x) * 4;
+test("matches the 440px shorter-side and 384px center-crop preprocessing", async () => {
+  const width = 447;
+  const height = 320;
+  const outputWidth = 384;
+  const outputHeight = 384;
+  const rgba = new Uint8ClampedArray(outputWidth * outputHeight * 4);
+  for (let y = 0; y < outputHeight; y += 1) {
+    for (let x = 0; x < outputWidth; x += 1) {
+      const offset = (y * outputWidth + x) * 4;
       rgba[offset] = (x * 13 + y * 7) % 256;
       rgba[offset + 1] = (x * 5 + y * 17 + 3) % 256;
       rgba[offset + 2] = (x * 19 + y * 11 + 9) % 256;
@@ -234,6 +271,8 @@ test("matches the antialiased Pillow bicubic preprocessing used for training", a
   }
 
   let captured;
+  let drawArgs;
+  let smoothing;
   const deps = dependencies({
     session: {
       inputNames: ["image"],
@@ -264,27 +303,72 @@ test("matches the antialiased Pillow bicubic preprocessing used for training", a
     fetchImpl: deps.fetchImpl,
     cryptoImpl: deps.cryptoImpl,
     imageBitmapFactory: async () => ({ width, height, close() {} }),
-    canvasFactory: () => ({
+    canvasFactory: (canvasWidth, canvasHeight) => ({
       getContext: () => ({
-        drawImage() {},
+        set imageSmoothingEnabled(value) {
+          smoothing = { ...(smoothing || {}), enabled: value };
+        },
+        set imageSmoothingQuality(value) {
+          smoothing = { ...(smoothing || {}), quality: value };
+        },
+        drawImage(...args) {
+          drawArgs = args;
+        },
         getImageData: () => ({ data: rgba }),
       }),
+      width: canvasWidth,
+      height: canvasHeight,
     }),
     BlobConstructor: class Blob {},
   });
 
   await backend.scoreImages([{ id: "fixture", source: "https://example.test/source.png" }]);
   assert.ok(captured instanceof Float32Array);
-  const plane = 224 * 224;
-  const indices = [0, 1, 223, 224, plane - 1, plane, plane * 2 - 1, plane * 2, plane * 3 - 1];
-  const expected = [
-    -1.9295316, -1.5014127, 0.8960527, -1.7069098, 1.7351657,
-    -1.7731092, -0.3375350, -1.3687146, -0.2183878,
-  ];
-  for (const [offset, index] of indices.entries()) {
-    assert.ok(
-      Math.abs(captured[index] - expected[offset]) < 1e-5,
-      `preprocessing mismatch at tensor index ${index}`,
-    );
+  assert.equal(captured.length, 3 * outputWidth * outputHeight);
+  assert.equal(drawArgs[0].width, width);
+  assert.equal(drawArgs[0].height, height);
+  assert.deepEqual(drawArgs.slice(1), [-115.5, -28, 615, 440]);
+  assert.deepEqual(smoothing, { enabled: true, quality: "high" });
+  const plane = outputWidth * outputHeight;
+  for (const [x, y] of [[0, 0], [11, 7], [383, 383], [203, 121]]) {
+    const pixel = y * outputWidth + x;
+    const rgbaOffset = pixel * 4;
+    const expected = [0, 1, 2].map((channel) => (
+      rgba[rgbaOffset + channel] / 255 - [0.485, 0.456, 0.406][channel]
+    ) / [0.229, 0.224, 0.225][channel]);
+    assert.ok(Math.abs(captured[pixel] - expected[0]) < 1e-6);
+    assert.ok(Math.abs(captured[plane + pixel] - expected[1]) < 1e-6);
+    assert.ok(Math.abs(captured[2 * plane + pixel] - expected[2]) < 1e-6);
   }
+});
+
+test("rejects extreme source dimensions before canvas rasterization", async () => {
+  const deps = dependencies();
+  const modelFetch = deps.fetchImpl;
+  deps.fetchImpl = async (url, options) => {
+    if (url === "https://example.test/wide.png") {
+      return response([1]);
+    }
+    return modelFetch(url, options);
+  };
+  const backend = await loadOnnxBackend({
+    ort: deps.ort,
+    modelUrl: "detector.onnx",
+    metadataUrl: "metadata.json",
+    fetchImpl: deps.fetchImpl,
+    cryptoImpl: deps.cryptoImpl,
+    imageBitmapFactory: async () => ({ width: 16_384, height: 1, close() {} }),
+    canvasFactory: () => { throw new Error("canvas must not be allocated"); },
+    BlobConstructor: class Blob {},
+  });
+
+  assert.deepEqual(
+    await backend.scoreImages([{ id: "wide", source: "https://example.test/wide.png" }]),
+    [{
+      id: "wide",
+      status: "error",
+      code: "IMAGE_DECODE_FAILED",
+      message: "decoded image dimensions exceed the runtime limits",
+    }],
+  );
 });

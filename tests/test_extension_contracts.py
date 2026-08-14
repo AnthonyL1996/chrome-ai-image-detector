@@ -51,9 +51,7 @@ class ExtensionContracts(unittest.TestCase):
         self.assertEqual(self.manifest["manifest_version"], 3)
         self.assertEqual(set(self.manifest["permissions"]), {"activeTab", "scripting"})
         self.assertNotIn("host_permissions", self.manifest)
-        self.assertEqual(
-            self.manifest["optional_host_permissions"], ["http://*/*", "https://*/*"]
-        )
+        self.assertNotIn("optional_host_permissions", self.manifest)
         self.assertNotIn("content_scripts", self.manifest)
         self.assertNotIn("externally_connectable", self.manifest)
         self.assertEqual(

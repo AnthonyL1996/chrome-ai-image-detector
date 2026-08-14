@@ -27,6 +27,7 @@ from poidh_detector.training import (
 ProfileName = Literal["overfit", "smoke", "pilot", "full"]
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GENERATION_ID = re.compile(r"^epoch-[0-9]{4,}-[0-9a-f]{16}$")
+FIXED_THRESHOLD = 0.65
 _PROFILE_VALUES: dict[str, dict[str, int | None]] = {
     "overfit": {
         "epochs": 30,
@@ -126,6 +127,7 @@ class ValidationMetrics:
     bce: float
     auc: float
     count: int
+    balanced_accuracy: float | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -148,6 +150,13 @@ class ValidationMetrics:
             or self.count <= 0
         ):
             raise ValueError("count must be a positive integer")
+        if self.balanced_accuracy is not None and (
+            isinstance(self.balanced_accuracy, bool)
+            or not isinstance(self.balanced_accuracy, (int, float))
+            or not math.isfinite(self.balanced_accuracy)
+            or not 0.0 <= self.balanced_accuracy <= 1.0
+        ):
+            raise ValueError("balanced_accuracy must be a finite number in [0, 1]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +355,7 @@ def publish_generation(
     selected: CheckpointCandidate,
     write_resume: ArtifactWriter,
     write_best_weights: ArtifactWriter,
+    selection_metric: str = "validation_bce",
     interruption_hook: InterruptionHook | None = None,
     os_name: str | None = None,
 ) -> LoadedGeneration:
@@ -353,8 +363,10 @@ def publish_generation(
 
     history = tuple(candidates)
     _validate_history(history, contract)
-    if selected != select_best_checkpoint(history):
-        raise ValueError("selected checkpoint is not the validation-BCE winner")
+    if selected != select_best_checkpoint(history, metric=selection_metric):
+        raise ValueError(
+            f"selected checkpoint is not the {selection_metric} winner"
+        )
     generations = output / "generations"
     if (
         not output.is_dir()
@@ -526,12 +538,16 @@ def load_current_generation(
     if hashlib.sha256(history_payload).hexdigest() != manifest.history_sha256:
         raise ValueError("history artifact digest does not match generation manifest")
     candidates = _parse_candidate_history(history_payload)
-    if _candidate_history_bytes(candidates) != history_payload:
+    if (
+        _candidate_history_bytes(candidates) != history_payload
+        and _candidate_history_bytes(candidates, include_balanced_accuracy=False)
+        != history_payload
+    ):
         raise ValueError("validation history must use canonical JSON encoding")
     _validate_history_values(candidates, manifest.epoch, manifest.global_step)
     if len(candidates) != manifest.history_count:
         raise ValueError("validation history count does not match generation manifest")
-    selected = select_best_checkpoint(candidates)
+    selected = select_best_checkpoint(candidates, metric=config.selection_metric)
     if selected.checkpoint_id != manifest.selected_checkpoint_id:
         raise ValueError("selected checkpoint does not match validation history")
     return LoadedGeneration(
@@ -629,6 +645,36 @@ def binary_auc(labels: Iterable[int], scores: Iterable[float]) -> float:
     )
 
 
+def balanced_accuracy_at_threshold(
+    labels: Iterable[int],
+    scores: Iterable[float],
+    *,
+    threshold: float = FIXED_THRESHOLD,
+) -> float:
+    pairs = list(zip(labels, scores, strict=True))
+    if not pairs:
+        raise ValueError("balanced accuracy requires at least one sample")
+    if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
+        raise ValueError("threshold must be finite and in (0, 1)")
+    if any(label not in (0, 1) for label, _ in pairs):
+        raise ValueError("balanced accuracy labels must be 0 or 1")
+    if any(not math.isfinite(score) for _, score in pairs):
+        raise ValueError("balanced accuracy scores must be finite")
+    positive_count = sum(label == 1 for label, _ in pairs)
+    negative_count = len(pairs) - positive_count
+    if not positive_count or not negative_count:
+        raise ValueError("balanced accuracy requires both classes")
+    true_positive = sum(
+        label == 1 and score >= threshold for label, score in pairs
+    )
+    true_negative = sum(
+        label == 0 and score < threshold for label, score in pairs
+    )
+    return 0.5 * (
+        true_positive / positive_count + true_negative / negative_count
+    )
+
+
 def candidate_from_validation(
     *,
     epoch: int,
@@ -642,6 +688,7 @@ def candidate_from_validation(
         global_step=global_step,
         validation_bce=validation.bce,
         training_bce=training_bce,
+        validation_balanced_accuracy=validation.balanced_accuracy,
     )
 
 
@@ -775,6 +822,9 @@ def evaluate_model(
         bce=loss_sum / len(all_labels),
         auc=binary_auc(all_labels, all_scores),
         count=len(all_labels),
+        balanced_accuracy=balanced_accuracy_at_threshold(
+            all_labels, all_scores, threshold=FIXED_THRESHOLD
+        ),
     )
 
 
@@ -858,10 +908,16 @@ def _validate_history_values(
 
 def _candidate_history_bytes(
     candidates: Sequence[CheckpointCandidate],
+    *,
+    include_balanced_accuracy: bool = True,
 ) -> bytes:
+    rows = [asdict(candidate) for candidate in candidates]
+    if not include_balanced_accuracy:
+        for row in rows:
+            row.pop("validation_balanced_accuracy", None)
     return _canonical_json(
         {
-            "candidates": [asdict(candidate) for candidate in candidates],
+            "candidates": rows,
             "schema_version": 1,
         }
     )
@@ -882,10 +938,22 @@ def _parse_candidate_history(payload: bytes) -> tuple[CheckpointCandidate, ...]:
         "global_step",
         "training_bce",
         "validation_bce",
+        "validation_balanced_accuracy",
     }
-    if any(set(row) != expected for row in rows):
-        raise ValueError("validation history candidate fields do not match the schema")
-    return tuple(CheckpointCandidate(**row) for row in rows)
+    legacy = expected - {"validation_balanced_accuracy"}
+    normalized = []
+    for row in rows:
+        fields = set(row)
+        if fields == legacy:
+            # Schema version 1 histories written before fixed-threshold
+            # selection did not record this optional diagnostic metric.
+            row = {**row, "validation_balanced_accuracy": None}
+        elif fields != expected:
+            raise ValueError(
+                "validation history candidate fields do not match the schema"
+            )
+        normalized.append(CheckpointCandidate(**row))
+    return tuple(normalized)
 
 
 def _environment_sha256(environment: Mapping[str, Any]) -> str:

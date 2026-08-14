@@ -10,6 +10,10 @@ from collections.abc import Iterable
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_SEED = 2**32 - 1
+_SELECTION_MINIMIZE = {
+    "validation_bce": True,
+    "validation_balanced_accuracy": False,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,10 +23,10 @@ class TrainingConfig:
     calibration_split_sha256: str
     exposed_holdout_sha256: tuple[str, ...]
     seed: int
+    selection_metric: str = "validation_bce"
     architecture: str = field(default="convnextv2_nano", init=False)
     weights_origin: str = field(default="random_initialization", init=False)
     pretrained: bool = field(default=False, init=False)
-    selection_metric: str = field(default="validation_bce", init=False)
     selection_minimize: bool = field(default=True, init=False)
     schema_version: int = field(default=1, init=False)
 
@@ -46,6 +50,16 @@ class TrainingConfig:
             or not 0 <= self.seed <= _MAX_SEED
         ):
             raise ValueError(f"seed must be an integer from 0 to {_MAX_SEED}")
+        if self.selection_metric not in _SELECTION_MINIMIZE:
+            raise ValueError(
+                "selection_metric must be validation_bce or "
+                "validation_balanced_accuracy"
+            )
+        object.__setattr__(
+            self,
+            "selection_minimize",
+            _SELECTION_MINIMIZE[self.selection_metric],
+        )
 
     def to_json_bytes(self) -> bytes:
         document = {
@@ -77,6 +91,7 @@ class CheckpointCandidate:
     global_step: int
     validation_bce: float
     training_bce: float | None = None
+    validation_balanced_accuracy: float | None = None
 
     def __post_init__(self) -> None:
         if not self.checkpoint_id or self.checkpoint_id != self.checkpoint_id.strip():
@@ -90,10 +105,17 @@ class CheckpointCandidate:
         _require_loss(self.validation_bce, "validation_bce")
         if self.training_bce is not None:
             _require_loss(self.training_bce, "training_bce")
+        if self.validation_balanced_accuracy is not None:
+            _require_unit_interval(
+                self.validation_balanced_accuracy,
+                "validation_balanced_accuracy",
+            )
 
 
 def select_best_checkpoint(
     candidates: Iterable[CheckpointCandidate],
+    *,
+    metric: str = "validation_bce",
 ) -> CheckpointCandidate:
     rows = list(candidates)
     if not rows:
@@ -101,14 +123,47 @@ def select_best_checkpoint(
     identifiers = [row.checkpoint_id for row in rows]
     if len(identifiers) != len(set(identifiers)):
         raise ValueError("duplicate checkpoint ID")
+    if metric not in _SELECTION_MINIMIZE:
+        raise ValueError(
+            "selection metric must be validation_bce or "
+            "validation_balanced_accuracy"
+        )
+    if metric == "validation_bce":
+        return min(
+            rows,
+            key=lambda row: (
+                row.validation_bce,
+                row.epoch,
+                row.global_step,
+                row.checkpoint_id,
+            ),
+        )
+    if any(row.validation_balanced_accuracy is None for row in rows):
+        raise ValueError(
+            "validation_balanced_accuracy is required for balanced-accuracy selection"
+        )
     return min(
         rows,
         key=lambda row: (
-            row.validation_bce,
+            -row.validation_balanced_accuracy,
             row.epoch,
             row.global_step,
             row.checkpoint_id,
         ),
+    )
+
+
+def checkpoint_selection_value(candidate: CheckpointCandidate, metric: str) -> float:
+    if metric == "validation_bce":
+        return candidate.validation_bce
+    if metric == "validation_balanced_accuracy":
+        if candidate.validation_balanced_accuracy is None:
+            raise ValueError(
+                "validation_balanced_accuracy is required for balanced-accuracy selection"
+            )
+        return candidate.validation_balanced_accuracy
+    raise ValueError(
+        "selection metric must be validation_bce or validation_balanced_accuracy"
     )
 
 
@@ -122,3 +177,13 @@ def _require_loss(value: float, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a finite non-negative number")
     if not math.isfinite(value) or value < 0.0:
         raise ValueError(f"{field_name} must be a finite non-negative number")
+
+
+def _require_unit_interval(value: float, field_name: str) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0.0 <= value <= 1.0
+    ):
+        raise ValueError(f"{field_name} must be a finite number in [0, 1]")

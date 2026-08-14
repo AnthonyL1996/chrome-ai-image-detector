@@ -73,8 +73,8 @@ test("collectImageCandidates deduplicates canonical sources", () => {
 test("resultLabel never presents unavailable inference as a confidence", () => {
   assert.equal(resultLabel({ status: "pending" }), "Local AI confidence: pending");
   assert.equal(
-    resultLabel({ status: "error", message: "Local model runtime is not bundled yet." }),
-    "Local AI confidence unavailable: Local model runtime is not bundled yet.",
+    resultLabel({ status: "error", message: "Local model runtime is unavailable." }),
+    "Local AI confidence unavailable: Local model runtime is unavailable.",
   );
   assert.equal(resultLabel({ status: "ok", confidence: 0.428 }), "Local AI confidence: 42.8%");
   assert.equal(
@@ -102,7 +102,7 @@ test("scanPage fans out deduplicated results with one non-focusable live summary
           {
             id: "image-1",
             status: "error",
-            message: "Local model runtime is not bundled yet.",
+            message: "Local model runtime is unavailable.",
           },
         ],
       };
@@ -125,7 +125,7 @@ test("scanPage fans out deduplicated results with one non-focusable live summary
     assert.equal(annotation.shadowRootCreated, true);
     assert.equal(
       annotation.textContent,
-      "Local AI confidence unavailable: Local model runtime is not bundled yet.",
+      "Local AI confidence unavailable: Local model runtime is unavailable.",
     );
   }
   assert.equal(page.liveRegions.length, 1);
@@ -135,6 +135,58 @@ test("scanPage fans out deduplicated results with one non-focusable live summary
   assert.match(page.root.querySelectorAll("img")[0].getAttribute("aria-describedby"), /poidh/);
   assert.match(page.root.querySelectorAll("img")[1].getAttribute("aria-describedby"), /poidh/);
   assert.deepEqual(summary, { count: 2, errors: 2, skipped: 1 });
+});
+
+test("scanPage materializes same-origin blob images in the page context", async () => {
+  const page = fakePage([
+    { currentSrc: "blob:https://example.test/image", src: "", alt: "Blob" },
+  ]);
+  let sent;
+  const summary = await scanPage({
+    root: page.root,
+    fetchImpl: async () => ({
+      ok: true,
+      arrayBuffer: async () => Uint8Array.of(0, 1, 2).buffer,
+      headers: { get: () => "image/png" },
+    }),
+    sendMessage: async (message) => {
+      sent = message;
+      return {
+        ok: true,
+        results: [{ id: "image-1", status: "ok", confidence: 0.75 }],
+      };
+    },
+  });
+
+  assert.equal(summary.errors, 0);
+  assert.match(sent.images[0].source, /^data:image\/png;base64,/);
+});
+
+test("scanPage bounds stalled blob materialization and keeps the source unavailable", async () => {
+  const page = fakePage([
+    { currentSrc: "blob:https://example.test/stalled", src: "", alt: "Blob" },
+  ]);
+  let aborted = false;
+  let sent;
+  const summary = await scanPage({
+    root: page.root,
+    blobFetchTimeoutMs: 5,
+    fetchImpl: async (_url, options) => {
+      options.signal.addEventListener("abort", () => { aborted = true; }, { once: true });
+      return new Promise(() => {});
+    },
+    sendMessage: async (message) => {
+      sent = message;
+      return {
+        ok: true,
+        results: [{ id: "image-1", status: "error", message: "blob unavailable" }],
+      };
+    },
+  });
+
+  assert.equal(aborted, true);
+  assert.equal(sent.images[0].source, "blob:https://example.test/stalled");
+  assert.deepEqual(summary, { count: 1, errors: 1, skipped: 0 });
 });
 
 test("scanPage turns messaging failures into visible per-image errors", async () => {

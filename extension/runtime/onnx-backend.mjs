@@ -1,9 +1,11 @@
-const IMAGE_SIZE = 224;
+const IMAGE_SIZE = 384;
+const RESIZE_SHORTER_SIDE = 440;
 const CHANNELS = 3;
 const TENSOR_LENGTH = CHANNELS * IMAGE_SIZE * IMAGE_SIZE;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_IMAGE_PIXELS = 16 * 1024 * 1024;
-const MAX_RESAMPLE_TAPS = 4097;
+const MAX_IMAGE_DIMENSION = 8192;
+const IMAGE_OPERATION_TIMEOUT_MS = 30_000;
 const MAX_MODEL_BYTES = 100 * 1024 * 1024;
 const MODEL_INPUT = "image";
 const MODEL_OUTPUT = "probability_ai";
@@ -21,6 +23,7 @@ export async function loadOnnxBackend({
   imageBitmapFactory = globalThis.createImageBitmap,
   canvasFactory = (width, height) => new OffscreenCanvas(width, height),
   BlobConstructor = globalThis.Blob,
+  imageLoadTimeoutMs = IMAGE_OPERATION_TIMEOUT_MS,
 } = {}) {
   if (!ort?.InferenceSession || typeof ort.InferenceSession.create !== "function") {
     throw new TypeError("onnxruntime-web must provide InferenceSession.create");
@@ -41,6 +44,9 @@ export async function loadOnnxBackend({
   assertExtensionResourceUrl(metadataUrl, "ONNX metadata");
   if (!cryptoImpl?.subtle || typeof cryptoImpl.subtle.digest !== "function") {
     throw new TypeError("Web Crypto SHA-256 is required");
+  }
+  if (!Number.isFinite(imageLoadTimeoutMs) || imageLoadTimeoutMs <= 0) {
+    throw new TypeError("imageLoadTimeoutMs must be a positive number");
   }
 
   const [modelBytes, metadata] = await Promise.all([
@@ -69,6 +75,7 @@ export async function loadOnnxBackend({
     imageBitmapFactory,
     canvasFactory,
     BlobConstructor,
+    timeoutMs: imageLoadTimeoutMs,
   });
 
   return Object.freeze({
@@ -176,7 +183,7 @@ function validateMetadata(metadata) {
     !sameArray(metadata.output_shape, [1, 1]) ||
     metadata.output_dtype !== "float32" ||
     metadata.output_semantics !== "calibrated_probability_ai" ||
-    metadata.calibration !== "platt_embedded" ||
+    metadata.calibration !== "sigmoid_embedded_offset_2.29" ||
     metadata.single_file !== true ||
     metadata.uses_external_data !== false
   ) {
@@ -185,8 +192,9 @@ function validateMetadata(metadata) {
   const preprocessing = metadata.preprocessing;
   if (
     !preprocessing ||
-    !sameArray(preprocessing.resize, [IMAGE_SIZE, IMAGE_SIZE]) ||
-    preprocessing.interpolation !== "bicubic" ||
+    preprocessing.resize_shorter_side !== RESIZE_SHORTER_SIDE ||
+    !sameArray(preprocessing.center_crop, [IMAGE_SIZE, IMAGE_SIZE]) ||
+    preprocessing.interpolation !== "canvas_2d_high" ||
     preprocessing.channel_order !== "RGB" ||
     preprocessing.layout !== "NCHW" ||
     preprocessing.input_dtype !== "uint8" ||
@@ -225,11 +233,48 @@ async function loadResourceBytes(fetchImpl, url, description) {
     credentials: "omit",
     redirect: "error",
   });
-  if (!response?.ok || typeof response.arrayBuffer !== "function") {
+  if (!response?.ok ||
+      (typeof response.arrayBuffer !== "function" &&
+       typeof response.body?.getReader !== "function")) {
     throw new Error(`${description} could not be loaded`);
   }
+  return readResponseBytes(response, MAX_MODEL_BYTES, description);
+}
+
+async function readResponseBytes(response, maxBytes, description) {
+  const declaredLength = Number(response.headers?.get?.("content-length"));
+  if (Number.isSafeInteger(declaredLength) && declaredLength > maxBytes) {
+    throw new Error(`${description} exceeds the runtime size limit`);
+  }
+  if (typeof response.body?.getReader === "function") {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+        total += chunk.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel();
+          throw new Error(`${description} exceeds the runtime size limit`);
+        }
+        chunks.push(chunk);
+      }
+    } finally {
+      reader.releaseLock?.();
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
+  }
   const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > MAX_MODEL_BYTES) {
+  if (bytes.byteLength > maxBytes) {
     throw new Error(`${description} exceeds the runtime size limit`);
   }
   return bytes;
@@ -245,6 +290,7 @@ function createImageTensorLoader({
   imageBitmapFactory,
   canvasFactory,
   BlobConstructor,
+  timeoutMs,
 }) {
   if (typeof imageBitmapFactory !== "function") {
     throw new TypeError("createImageBitmap is required for browser image decoding");
@@ -257,134 +303,105 @@ function createImageTensorLoader({
   }
 
   return async (source) => {
-    if (typeof source !== "string" || !SUPPORTED_SOURCE.test(source.trim())) {
-      throw new Error("image source is unsupported");
-    }
-    const response = await fetchImpl(source, {
-      cache: "no-store",
-      credentials: "omit",
-      redirect: "error",
-    });
-    if (!response?.ok || typeof response.arrayBuffer !== "function") {
-      throw new Error("image could not be loaded");
-    }
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength === 0 || bytes.byteLength > MAX_IMAGE_BYTES) {
-      throw new Error("image exceeds the 20 MiB decode limit");
-    }
-    const mime = response.headers?.get?.("content-type") || "application/octet-stream";
-    const bitmap = await imageBitmapFactory(new BlobConstructor([bytes], { type: mime }));
-    const width = Number(bitmap?.width);
-    const height = Number(bitmap?.height);
-    if (
-      !Number.isInteger(width) ||
-      !Number.isInteger(height) ||
-      width < 1 ||
-      height < 1 ||
-      width * height > MAX_IMAGE_PIXELS
-    ) {
-      bitmap?.close?.();
-      throw new Error("decoded image dimensions exceed the 16 megapixel limit");
-    }
-    const canvas = canvasFactory(width, height);
-    const context = canvas?.getContext?.("2d", { willReadFrequently: true });
-    if (!context || typeof context.drawImage !== "function" || typeof context.getImageData !== "function") {
-      bitmap?.close?.();
-      throw new Error("browser image canvas is unavailable");
-    }
-    try {
-      context.drawImage(bitmap, 0, 0, width, height);
-      return tensorFromRgba(
-        context.getImageData(0, 0, width, height).data,
-        width,
-        height,
-      );
-    } finally {
-      bitmap?.close?.();
-    }
+    const controller = createAbortController();
+    return withTimeout(async () => {
+      if (typeof source !== "string" || !SUPPORTED_SOURCE.test(source.trim())) {
+        throw new Error("image source is unsupported");
+      }
+      const response = await fetchImpl(source, {
+        cache: "no-store",
+        credentials: "omit",
+        redirect: "error",
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      if (!response?.ok ||
+          (typeof response.arrayBuffer !== "function" &&
+           typeof response.body?.getReader !== "function")) {
+        throw new Error("image could not be loaded");
+      }
+      const bytes = await readResponseBytes(response, MAX_IMAGE_BYTES, "image");
+      if (bytes.byteLength === 0) {
+        throw new Error("image exceeds the 20 MiB decode limit");
+      }
+      const mime = response.headers?.get?.("content-type") || "application/octet-stream";
+      const bitmap = await imageBitmapFactory(new BlobConstructor([bytes], { type: mime }));
+      const width = Number(bitmap?.width);
+      const height = Number(bitmap?.height);
+      if (
+        !Number.isInteger(width) ||
+        !Number.isInteger(height) ||
+        width < 1 ||
+        height < 1 ||
+        width > MAX_IMAGE_DIMENSION ||
+        height > MAX_IMAGE_DIMENSION ||
+        width * height > MAX_IMAGE_PIXELS
+      ) {
+        bitmap?.close?.();
+        throw new Error("decoded image dimensions exceed the runtime limits");
+      }
+      const scale = RESIZE_SHORTER_SIDE / Math.min(width, height);
+      const resizedWidth = Math.max(1, Math.round(width * scale));
+      const resizedHeight = Math.max(1, Math.round(height * scale));
+      const canvas = canvasFactory(IMAGE_SIZE, IMAGE_SIZE);
+      const context = canvas?.getContext?.("2d", { willReadFrequently: true });
+      if (!context || typeof context.drawImage !== "function" || typeof context.getImageData !== "function") {
+        bitmap?.close?.();
+        throw new Error("browser image canvas is unavailable");
+      }
+      try {
+        context.imageSmoothingEnabled = true;
+        context.imageSmoothingQuality = "high";
+        context.drawImage(
+          bitmap,
+          (IMAGE_SIZE - resizedWidth) / 2,
+          (IMAGE_SIZE - resizedHeight) / 2,
+          resizedWidth,
+          resizedHeight,
+        );
+        return tensorFromRgba(context.getImageData(0, 0, IMAGE_SIZE, IMAGE_SIZE).data);
+      } finally {
+        bitmap?.close?.();
+      }
+    }, timeoutMs, controller);
   };
 }
 
-function tensorFromRgba(rgba, sourceWidth, sourceHeight) {
-  if (
-    !rgba ||
-    !Number.isInteger(sourceWidth) ||
-    !Number.isInteger(sourceHeight) ||
-    sourceWidth < 1 ||
-    sourceHeight < 1 ||
-    rgba.length !== sourceWidth * sourceHeight * 4
-  ) {
+function createAbortController() {
+  return typeof globalThis.AbortController === "function"
+    ? new globalThis.AbortController()
+    : null;
+}
+
+async function withTimeout(operation, timeoutMs, controller) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller?.abort();
+      reject(new Error("image decode/load timed out"));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([Promise.resolve().then(operation), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function tensorFromRgba(rgba) {
+  if (!rgba || rgba.length !== IMAGE_SIZE * IMAGE_SIZE * 4) {
     throw new Error("decoded image has an invalid size");
   }
   const tensor = new Float32Array(TENSOR_LENGTH);
   const plane = IMAGE_SIZE * IMAGE_SIZE;
-  const xTaps = bicubicTaps(sourceWidth, IMAGE_SIZE);
-  const yTaps = bicubicTaps(sourceHeight, IMAGE_SIZE);
-  for (let y = 0; y < IMAGE_SIZE; y += 1) {
-    const yTap = yTaps[y];
-    for (let x = 0; x < IMAGE_SIZE; x += 1) {
-      const xTap = xTaps[x];
-      const pixel = y * IMAGE_SIZE + x;
-      for (let channel = 0; channel < CHANNELS; channel += 1) {
-        let value = 0;
-        for (let yIndex = 0; yIndex < yTap.indices.length; yIndex += 1) {
-          let row = 0;
-          const sourceRow = yTap.indices[yIndex] * sourceWidth;
-          for (let xIndex = 0; xIndex < xTap.indices.length; xIndex += 1) {
-            const source = (sourceRow + xTap.indices[xIndex]) * 4;
-            row += rgba[source + channel] * xTap.weights[xIndex];
-          }
-          value += row * yTap.weights[yIndex];
-        }
-        const resized = Math.floor(Math.min(255, Math.max(0, value)) + 0.5);
-        const normalized = resized / 255;
-        tensor[channel * plane + pixel] =
-          (normalized - MEAN[channel]) / STANDARD_DEVIATION[channel];
-      }
+  for (let pixel = 0; pixel < plane; pixel += 1) {
+    const source = pixel * 4;
+    for (let channel = 0; channel < CHANNELS; channel += 1) {
+      const normalized = rgba[source + channel] / 255;
+      tensor[channel * plane + pixel] =
+        (normalized - MEAN[channel]) / STANDARD_DEVIATION[channel];
     }
   }
   return tensor;
-}
-
-function bicubicTaps(sourceSize, targetSize) {
-  const scale = sourceSize / targetSize;
-  const filterScale = Math.max(scale, 1);
-  const support = 2 * filterScale;
-  const kernelSize = Math.ceil(support) * 2 + 1;
-  if (kernelSize > MAX_RESAMPLE_TAPS) {
-    throw new Error("decoded image dimensions require too many resampling taps");
-  }
-  const taps = [];
-  for (let target = 0; target < targetSize; target += 1) {
-    const center = (target + 0.5) * scale;
-    const start = Math.max(0, Math.floor(center - support + 0.5));
-    const end = Math.min(sourceSize, Math.floor(center + support + 0.5));
-    const indices = [];
-    const weights = [];
-    for (let source = start; source < end; source += 1) {
-      indices.push(source);
-      weights.push(
-        cubicWeight((source - center + 0.5) / filterScale) / filterScale,
-      );
-    }
-    const total = weights.reduce((sum, weight) => sum + weight, 0);
-    taps.push({
-      indices,
-      weights: total === 0 ? weights.map(() => 0) : weights.map((weight) => weight / total),
-    });
-  }
-  return taps;
-}
-
-function cubicWeight(distance) {
-  const absolute = Math.abs(distance);
-  if (absolute <= 1) {
-    return 1.5 * absolute ** 3 - 2.5 * absolute ** 2 + 1;
-  }
-  if (absolute < 2) {
-    return -0.5 * absolute ** 3 + 2.5 * absolute ** 2 - 4 * absolute + 2;
-  }
-  return 0;
 }
 
 function safeMessage(error) {

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "model_format": "onnx",
+  "model_sha256": "89be5ba0b80dfa2e2fa6bbc3eea28562a07a067905d8407f8540ebfa13a565ba",
+  "input_name": "image",
+  "input_shape": [1, 3, 384, 384],
+  "input_dtype": "float32",
+  "output_name": "probability_ai",
+  "output_shape": [1, 1],
+  "output_dtype": "float32",
+  "output_semantics": "calibrated_probability_ai",
+  "calibration": "sigmoid_embedded_offset_2.29",
+  "preprocessing": {
+    "resize_shorter_side": 440,
+    "center_crop": [384, 384],
+    "interpolation": "canvas_2d_high",
+    "channel_order": "RGB",
+    "layout": "NCHW",
+    "input_dtype": "uint8",
+    "output_dtype": "float32",
+    "input_scale": 0.00392156862745098,
+    "mean": [0.485, 0.456, 0.406],
+    "standard_deviation": [0.229, 0.224, 0.225]
+  },
+  "single_file": true,
+  "uses_external_data": false,
+  "max_model_bytes": 104857600
+}

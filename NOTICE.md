@@ -19,6 +19,18 @@ licenses are not replaced by this repository's MIT license.
   `ort-wasm-simd-threaded.wasm` (SHA-256
   `d1ab1b94b16a65b29d710d0b587b29e7bed336827577623913479b8afe8113e6`).
   Copyright Microsoft Corporation and contributors.
+- **Community Forensics ViT-S/16 @384** supplies the upstream detector lineage
+  and MIT-licensed model implementation/weights (Jeongsoo Park and Andrew
+  Owens; [upstream repository](https://github.com/JeongsooP/Community-Forensics),
+  [model card](https://huggingface.co/OwensLab/commfor-model-384)). The bundled
+  graph is derived from the public export in
+  [`pixilated730/local-ai-image-detector`](https://github.com/pixilated730/local-ai-image-detector)
+  at commit `dddb57b`, whose source ONNX SHA-256 is
+  `0fb7bf7c74cf2808b9c0b6a068126739cb5b2dae72be33fa971babe912ec466e`.
+  This repository's deterministic wrapper renames the I/O tensors and embeds
+  the +2.29 logit offset plus sigmoid. The resulting bundled file is
+  `extension/model/detector.onnx`, SHA-256
+  `89be5ba0b80dfa2e2fa6bbc3eea28562a07a067905d8407f8540ebfa13a565ba`.
 
 ## MONET dataset metadata and selected subsets
 
@@ -39,8 +51,8 @@ before use or redistribution.
 
 ## Bundled and unbundled third-party artifacts
 
-The extension bundles only the ONNX Runtime Web files listed above. This
-repository does not bundle third-party datasets, images, pretrained weights,
-trained checkpoints, or detector model weights. Installing optional
-dependencies or downloading data is a separate action governed by the relevant
-upstream licenses and terms.
+The extension bundles the ONNX Runtime Web files and the Community
+Forensics-derived detector listed above. This repository does not bundle
+third-party datasets, images, or MONET training checkpoints. Installing
+optional dependencies or downloading data is a separate action governed by the
+relevant upstream licenses and terms.

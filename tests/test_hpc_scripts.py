@@ -111,6 +111,7 @@ def _run_training_script(
         "VSC_SCRATCH",
         "POIDH_WORKERS",
         "POIDH_EPOCHS",
+        "POIDH_SELECTION_METRIC",
     ):
         environment.pop(variable, None)
     if worker_count is not None:
@@ -219,6 +220,8 @@ class HpcScriptContracts(unittest.TestCase):
         self.assertIn('--workers "${TRAIN_WORKERS}"', script)
         self.assertIn('TRAIN_EPOCHS="${POIDH_EPOCHS:-}"', script)
         self.assertIn('--epochs "${TRAIN_EPOCHS}"', script)
+        self.assertIn('TRAIN_SELECTION_METRIC="${POIDH_SELECTION_METRIC:-validation_bce}"', script)
+        self.assertIn('--selection-metric "${TRAIN_SELECTION_METRIC}"', script)
 
     def test_training_worker_count_can_be_pinned_independently_of_slurm_rounding(
         self,
@@ -377,6 +380,8 @@ class HpcScriptContracts(unittest.TestCase):
         self.assertNotIn("--export=ALL", readme)
         self.assertIn('--export=POIDH_WORKERS="${POIDH_WORKERS}"', readme)
         self.assertIn('--export=POIDH_WORKERS="${POIDH_WORKERS}",POIDH_EPOCHS="${POIDH_EPOCHS}"', readme)
+        self.assertIn('POIDH_SELECTION_METRIC=validation_balanced_accuracy', readme)
+        self.assertIn(',POIDH_SELECTION_METRIC="${POIDH_SELECTION_METRIC}"', readme)
         self.assertIn('"${POIDH_PYTHON_DEPS}"', readme)
 
     def test_compute_jobs_never_install_or_download_packages(self) -> None:

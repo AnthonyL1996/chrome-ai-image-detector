@@ -47,7 +47,7 @@ async function scanActiveTab(sender) {
   const scan = { pageOrigin: null };
   activeScanTabs.set(tab.id, scan);
   try {
-    scan.pageOrigin = await ensureOriginAccess(tab);
+    scan.pageOrigin = pageOriginForTab(tab);
     await chrome.scripting.insertCSS({
       target: { tabId: tab.id },
       files: ["content.css"],
@@ -62,25 +62,10 @@ async function scanActiveTab(sender) {
   }
 }
 
-async function ensureOriginAccess(tab) {
+function pageOriginForTab(tab) {
   const url = new URL(typeof tab.url === "string" ? tab.url : "");
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("The active page has no requestable web origin.");
-  }
-  if (
-    !chrome.permissions ||
-    typeof chrome.permissions.contains !== "function" ||
-    typeof chrome.permissions.request !== "function"
-  ) {
-    return url.origin;
-  }
-  const origin = `${url.origin}/*`;
-  const details = { origins: [origin] };
-  if (await chrome.permissions.contains(details)) {
-    return url.origin;
-  }
-  if (!(await chrome.permissions.request(details))) {
-    throw new Error(`Optional access to ${url.origin} was denied.`);
   }
   return url.origin;
 }
@@ -92,6 +77,15 @@ function partitionScoringSources(images, { pageOrigin }) {
     const source = image.source;
     if (/^data:image\//i.test(source)) {
       allowed.push(image);
+      continue;
+    }
+    if (/^blob:/i.test(source)) {
+      blocked.push({
+        id: image.id,
+        status: "error",
+        code: "IMAGE_BLOB_NOT_MATERIALIZED",
+        message: "Blob image could not be materialized in the webpage context.",
+      });
       continue;
     }
     const url = new URL(source);

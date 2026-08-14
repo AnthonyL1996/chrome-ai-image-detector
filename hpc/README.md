@@ -137,6 +137,17 @@ TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --cpus-per-task="${
 This creates a fresh run with a distinct optimization configuration. Repeat
 the same `POIDH_EPOCHS` export if resuming that run; changing it invalidates
 the resume provenance contract.
+To select the checkpoint by the bounty's fixed 0.65 balanced-accuracy
+objective instead of validation BCE, set it explicitly and include it in the
+`sbatch --export` list:
+
+```bash
+POIDH_SELECTION_METRIC=validation_balanced_accuracy
+TRAIN_JOB_ID="$(sbatch --parsable --time="${TRAIN_WALLTIME}" --cpus-per-task="${POIDH_WORKERS}" --output="${POIDH_RUN_ROOT}/logs/h100-train-%j.out" --export=POIDH_WORKERS="${POIDH_WORKERS}",POIDH_EPOCHS="${POIDH_EPOCHS}",POIDH_SELECTION_METRIC="${POIDH_SELECTION_METRIC}" hpc/wice_h100_train.slurm "${VSC_SCRATCH}" "${POIDH_DATA_ROOT}" "${POIDH_RUN_ROOT}" "${POIDH_PYTHON_DEPS}" "${TRAIN_PROFILE}" 0)"
+```
+
+The selection metric is part of the training configuration and must be
+repeated when resuming.
 Each fresh job writes to
 `${POIDH_RUN_ROOT}/${TRAIN_PROFILE}-${SLURM_JOB_ID}`. To resume a
 transactionally published run after a walltime stop, reuse its one-component

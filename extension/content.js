@@ -3,6 +3,8 @@
 ((scope) => {
   const RESULT_CLASS = "poidh-ai-result";
   const SUPPORTED_SOURCE = /^(?:https?:|blob:|data:image\/)/i;
+  const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+  const BLOB_MATERIALIZE_TIMEOUT_MS = 30_000;
   const states = new WeakMap();
   let scanSequence = 0;
 
@@ -203,7 +205,139 @@
     return `${count} images scanned; ${errors} unavailable; ${skipped} skipped.`;
   }
 
-  async function scanPage({ root, sendMessage }) {
+  function bytesToBase64(bytes) {
+    if (typeof btoa !== "function") {
+      throw new Error("page does not provide base64 encoding");
+    }
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  async function readResponseBytes(response) {
+    if (typeof response.body?.getReader === "function") {
+      const reader = response.body.getReader();
+      const chunks = [];
+      let total = 0;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+          total += chunk.byteLength;
+          if (total > MAX_IMAGE_BYTES) {
+            await reader.cancel();
+            throw new Error("blob image exceeds the 20 MiB decode limit");
+          }
+          chunks.push(chunk);
+        }
+      } finally {
+        reader.releaseLock?.();
+      }
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return bytes;
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.length > MAX_IMAGE_BYTES) {
+      throw new Error("blob image exceeds the 20 MiB decode limit");
+    }
+    return bytes;
+  }
+
+  async function materializeBlobSources(
+    groups,
+    {
+      fetchImpl = globalThis.fetch,
+      baseURI,
+      timeoutMs = BLOB_MATERIALIZE_TIMEOUT_MS,
+    } = {},
+  ) {
+    if (typeof fetchImpl !== "function") {
+      return groups;
+    }
+    const pageOrigin = new URL(baseURI).origin;
+    return Promise.all(groups.map(async ({ request, elements }) => {
+      if (!/^blob:/i.test(request.source)) {
+        return { request, elements };
+      }
+      const controller = createAbortController();
+      let blobUrl;
+      try {
+        return await withTimeout(async () => {
+          blobUrl = new URL(request.source);
+          if (blobUrl.origin !== pageOrigin) {
+            return { request, elements };
+          }
+          const response = await fetchImpl(request.source, {
+            cache: "no-store",
+            credentials: "same-origin",
+            redirect: "error",
+            ...(controller ? { signal: controller.signal } : {}),
+          });
+          if (!response?.ok ||
+              (typeof response.arrayBuffer !== "function" &&
+               typeof response.body?.getReader !== "function")) {
+            throw new Error("blob image could not be loaded from the page");
+          }
+          const bytes = await readResponseBytes(response);
+          if (bytes.length === 0 || bytes.length > MAX_IMAGE_BYTES) {
+            throw new Error("blob image exceeds the 20 MiB decode limit");
+          }
+          const mime = response.headers?.get?.("content-type") || "image/png";
+          if (!/^image\//i.test(mime)) {
+            throw new Error("blob image has a non-image content type");
+          }
+          return {
+            elements,
+            request: {
+              ...request,
+              source: `data:${mime};base64,${bytesToBase64(bytes)}`,
+            },
+          };
+        }, timeoutMs, controller);
+      } catch {
+        // Keep the original source so the service worker can return a
+        // structured unavailable result without widening its fetch boundary.
+        return { request, elements };
+      }
+    }));
+  }
+
+  function createAbortController() {
+    return typeof globalThis.AbortController === "function"
+      ? new globalThis.AbortController()
+      : null;
+  }
+
+  async function withTimeout(operation, timeoutMs, controller) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        controller?.abort();
+        reject(new Error("blob image materialization timed out"));
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([Promise.resolve().then(operation), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function scanPage({
+    root,
+    sendMessage,
+    fetchImpl = globalThis.fetch,
+    blobFetchTimeoutMs = BLOB_MATERIALIZE_TIMEOUT_MS,
+  }) {
     cleanup(root);
     const factory = elementFactory(root);
     const plan = planFor(root);
@@ -235,9 +369,14 @@
     }
 
     try {
+      const materialized = await materializeBlobSources(plan.groups, {
+        fetchImpl,
+        baseURI: root.baseURI,
+        timeoutMs: blobFetchTimeoutMs,
+      });
       const response = await sendMessage({
         type: "SCORE_IMAGES",
-        images: plan.groups.map(({ request }) => request),
+        images: materialized.map(({ request }) => request),
       });
       const results = validatedResults(response, plan.groups);
       let errors = 0;

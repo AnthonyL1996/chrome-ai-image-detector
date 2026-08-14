@@ -157,7 +157,7 @@ export function createModelRuntime({ backend = null } = {}) {
       return validated.map(({ id }) => ({
         code: "MODEL_RUNTIME_UNAVAILABLE",
         id,
-        message: "Local model runtime is not bundled yet.",
+        message: "Local model runtime is unavailable.",
         status: "error",
       }));
     },

@@ -76,6 +76,7 @@ def main() -> None:
         calibration_split_sha256=calibration_hash,
         exposed_holdout_sha256=holdout_hashes,
         seed=arguments.seed,
+        selection_metric=arguments.selection_metric,
     )
     overrides: dict[str, Any] = {"num_workers": arguments.workers}
     if arguments.epochs is not None:
@@ -216,7 +217,9 @@ def main() -> None:
                 validation=validation,
             )
             candidates.append(candidate)
-            selected = select_best_checkpoint(candidates)
+            selected = select_best_checkpoint(
+                candidates, metric=config.selection_metric
+            )
 
         contract = ResumeContract.create(
             config=config,
@@ -257,6 +260,7 @@ def main() -> None:
             selected=selected,
             write_resume=write_resume,
             write_best_weights=write_best_weights,
+            selection_metric=config.selection_metric,
         )
         print(
             json.dumps(
@@ -266,6 +270,8 @@ def main() -> None:
                     "training_bce": training_bce,
                     "validation_bce": validation.bce,
                     "validation_auc": validation.auc,
+                    "validation_balanced_accuracy": validation.balanced_accuracy,
+                    "selection_metric": config.selection_metric,
                     "selected_checkpoint": selected.checkpoint_id,
                 },
                 sort_keys=True,
@@ -275,7 +281,7 @@ def main() -> None:
 
     if not candidates:
         raise ValueError("resume checkpoint already exceeds configured epoch count")
-    selected = select_best_checkpoint(candidates)
+    selected = select_best_checkpoint(candidates, metric=config.selection_metric)
     if current_generation is None:
         raise RuntimeError("training completed without a published generation")
     print(
@@ -283,6 +289,8 @@ def main() -> None:
             {
                 "best_checkpoint": selected.checkpoint_id,
                 "best_validation_bce": selected.validation_bce,
+                "best_validation_balanced_accuracy": selected.validation_balanced_accuracy,
+                "selection_metric": config.selection_metric,
                 "weights": str(current_generation.best_weights_path),
             },
             indent=2,
@@ -301,6 +309,12 @@ def _parse_arguments() -> argparse.Namespace:
         "--profile", choices=("overfit", "smoke", "pilot", "full"), default="smoke"
     )
     parser.add_argument("--seed", type=int, default=323)
+    parser.add_argument(
+        "--selection-metric",
+        choices=("validation_bce", "validation_balanced_accuracy"),
+        default="validation_bce",
+        help="Checkpoint selection metric; balanced accuracy uses the fixed 0.65 threshold.",
+    )
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--workers", type=int, default=4)

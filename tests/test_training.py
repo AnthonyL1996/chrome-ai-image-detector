@@ -39,6 +39,17 @@ class TrainingConfigTests(unittest.TestCase):
         self.assertTrue(config.selection_minimize)
         self.assertTrue(config.to_json_bytes().endswith(b"\n"))
 
+        balanced = TrainingConfig(
+            dataset_manifest_sha256=config.dataset_manifest_sha256,
+            split_manifest_sha256=config.split_manifest_sha256,
+            calibration_split_sha256=config.calibration_split_sha256,
+            exposed_holdout_sha256=config.exposed_holdout_sha256,
+            seed=config.seed,
+            selection_metric="validation_balanced_accuracy",
+        )
+        self.assertEqual(balanced.selection_metric, "validation_balanced_accuracy")
+        self.assertFalse(balanced.selection_minimize)
+
         with self.assertRaisesRegex(AttributeError, "cannot assign"):
             config.seed = 7  # type: ignore[misc]
 
@@ -91,6 +102,29 @@ class CheckpointSelectionTests(unittest.TestCase):
             select_best_checkpoint([earlier, later]),
         )
         self.assertEqual(select_best_checkpoint([later, earlier]), earlier)
+
+    def test_can_select_highest_fixed_threshold_balanced_accuracy(self) -> None:
+        candidates = [
+            CheckpointCandidate(
+                "epoch-1", 1, 100, 0.25, validation_balanced_accuracy=0.72
+            ),
+            CheckpointCandidate(
+                "epoch-2", 2, 200, 0.30, validation_balanced_accuracy=0.81
+            ),
+        ]
+        self.assertEqual(
+            select_best_checkpoint(
+                candidates, metric="validation_balanced_accuracy"
+            ).checkpoint_id,
+            "epoch-2",
+        )
+
+    def test_balanced_accuracy_selection_requires_metric_on_every_candidate(self) -> None:
+        with self.assertRaisesRegex(ValueError, "balanced-accuracy selection"):
+            select_best_checkpoint(
+                [CheckpointCandidate("epoch-1", 1, 1, 0.2)],
+                metric="validation_balanced_accuracy",
+            )
 
     def test_rejects_invalid_or_ambiguous_candidates(self) -> None:
         valid = CheckpointCandidate("epoch-1", 1, 100, 0.2)

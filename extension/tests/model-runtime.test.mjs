@@ -22,7 +22,7 @@ test("unconfigured runtime reports local-only unavailable results", async () => 
       {
         code: "MODEL_RUNTIME_UNAVAILABLE",
         id: "image-1",
-        message: "Local model runtime is not bundled yet.",
+        message: "Local model runtime is unavailable.",
         status: "error",
       },
     ],
